@@ -6,7 +6,7 @@ A **plug-and-play Cloudflare Worker** that exposes the HouseCall Pro API as an M
 
 ## Features
 
-- **93 tools** — complete HCP API coverage (customers, jobs, estimates, invoices, leads, pricebook, dispatch, and more)
+- **104 tools** — complete HCP API coverage (customers, jobs, estimates, invoices, leads, pricebook, dispatch, and more)
 - **Token-based auth** — read/write access tiers, tokens stored in Cloudflare KV
 - **`fetch_all` pagination** — auto-paginate any of 10 list tools, up to ~2000 records
 - **Webhook receiver** — validates HMAC-SHA256, stores events in KV (48h TTL), optional Zapier forwarding
@@ -101,7 +101,7 @@ https://your-worker.workers.dev/mcp?token=my-secret-token-123
 
 ```bash
 curl https://your-worker.workers.dev/
-# → "HouseCall Pro MCP Worker v3.3.1 — 93 tools | /mcp | /webhook | /activity | /dashboard"
+# → "HouseCall Pro MCP Worker v3.4.5 — 104 tools | /mcp | /webhook | /activity | /dashboard"
 ```
 
 ---
@@ -118,13 +118,13 @@ Authorization: Bearer YOUR_TOKEN
 Tokens are stored in the `MCP_TOKENS` KV namespace as JSON:
 
 ```json
-{"name": "Kyle", "tier": "write"}
+{"name": "Your Name", "tier": "write"}
 ```
 
 | Tier | What it can do |
 |---|---|
 | `read` | `tools/list` and `tools/call` on read-only tools (list/get) only |
-| `write` | Full access — all 93 tools including create, update, delete |
+| `write` | Full access — all 104 tools including create, update, delete |
 
 **To add a user:** KV dashboard → `hcp-tokens` → Add entry → key = token string, value = JSON above.  
 **To revoke:** Delete the key from the KV dashboard.
@@ -177,7 +177,7 @@ Tools that support `fetch_all`:
 
 ---
 
-## Tools (93 total)
+## Tools (104 total)
 
 Organized by resource:
 
@@ -194,7 +194,7 @@ Organized by resource:
 **Pipeline:** list statuses, update status (jobs/estimates/leads)  
 **Company:** get info, update franchise info, checklists, webhooks (create/delete)
 
-> Note: 8 undocumented/non-functional endpoints were removed in v2.8.0 compared to the original template. The 93 tools here are all confirmed working against the live HCP API.
+> Note: 8 undocumented/non-functional endpoints were removed in v2.8.0 compared to the original template. The 104 tools here are all confirmed working against the live HCP API.
 
 ---
 
@@ -263,6 +263,12 @@ All are **Secrets** in Cloudflare dashboard — never put them in `wrangler.toml
 
 | Version | Changes |
 |---|---|
+| v3.4.5 | Three real worker bugs caught by end-to-end test: `dispatch_job` body shape, `create_estimate` auto-injects default option, `convert_lead` POST not PUT. Description fixes on `update_job_appointment` + 3 `bulk_update_*` tools + `create_estimate` + `create_lead` (now requires `customer_id`) |
+| v3.4.4 | Read-tool polish on 15 more tools (employees, events, appointments, line items, invoices, materials, services, tags, job types, lead sources, pipeline statuses, checklists, etc.). `raw=true` opt-out wired. `normalizePricebookPage` now bypassed by `raw=true` (bug fix). |
+| v3.4.3 | Write-tool description rewrites (~33 tools) with what/when/returns/caveats. Documented the three schedule param conventions across `create_job` / `update_job_schedule` / `create_job_appointment`. No schema field changes. |
+| v3.4.2 | Description rewrites + `raw=true` on 8 more read tools (invoices, customers, estimates, leads). Extended `work_status` enum with production values. |
+| v3.4.1 | Universal Tier-A field strip — 5 always-safe fields (`permissions`, `company_name`, `company_id`, `avatar_url`, `color_hex`) stripped recursively from every HCP response. Rolled back over-aggressive per-tool projection from v3.4.0. `raw=true` per-call opt-out, `_pagination` plaintext hint on registered list tools, `PROJECT_ENABLED` kill switch. |
+| v3.4.0 | MCP optimization pilot on `list_jobs` + `get_job` — field projection, expanded MCP annotations (all 4 hints), rewritten descriptions, `work_status` enum additions. |
 | v3.3.1 | Inline PNG icon in MCP serverInfo |
 | v3.3.0 | Token-based auth with read/write tiers (MCP_TOKENS KV) |
 | v3.2.0 | Expose undocumented HCP API params (sort_by for events/customers/invoices) |
@@ -272,6 +278,28 @@ All are **Secrets** in Cloudflare dashboard — never put them in `wrangler.toml
 | v2.8.x | Remove 8 undocumented/broken tools, fix `convert_lead` method |
 | v2.6.0 | MCP annotations (`readOnlyHint`, `destructiveHint`) for all tools |
 | v1.0.0 | Initial template release |
+
+---
+
+## Using with Claude Code (skill + memory drop-ins)
+
+If you use Claude Code (or any agent that supports skills + memory files), this template ships with three drop-in operational references that make the worker much more usable from the agent. They cover the API's footguns (cents vs. dollars, three different schedule-param conventions, broken endpoints to avoid, fetch_all caps, the universal field strip), so the agent doesn't rediscover them every session.
+
+| File | Purpose | Where to copy |
+|---|---|---|
+| [`examples/claude-skill/SKILL.md`](examples/claude-skill/SKILL.md) | Operational quick-card auto-loaded when HCP topics come up | `~/.claude/skills/hcp-ops/SKILL.md` |
+| [`examples/claude-memory/hcp_tool.md`](examples/claude-memory/hcp_tool.md) | Tool reference: auth, projection, money fields, corrected param names, known broken endpoints | Your memory directory (e.g. `~/.claude/projects/<encoded>/memory/`) |
+| [`examples/claude-memory/hcp_full.md`](examples/claude-memory/hcp_full.md) | Deep reference: `list_jobs` / `list_leads` / `list_invoices` field-by-field, response shapes, pipeline ID table structure | Same memory directory |
+
+**Quick install (Claude Code on macOS/Linux):**
+```bash
+mkdir -p ~/.claude/skills/hcp-ops
+cp examples/claude-skill/SKILL.md ~/.claude/skills/hcp-ops/
+# memory directory location varies — see your Claude Code docs
+cp examples/claude-memory/hcp_*.md /path/to/your/memory/dir/
+```
+
+After copying, edit the placeholders in each file — worker URL, KV namespace ID, employee IDs (pull from `list_employees`), and pipeline IDs (pull from `list_pipeline_statuses` for each `resource_type`).
 
 ---
 

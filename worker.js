@@ -1,6 +1,62 @@
 /**
- * HouseCall Pro MCP Worker v3.3.3
+ * HouseCall Pro MCP Worker v3.4.5
  * Documented API only (93 tools) + Webhook receiver + Activity feed + Dashboard v2.5
+ *
+ * v3.4.5: Post-end-to-end-test fixes — 3 code bugs + 5 description rewrites. dispatch_job
+ *         now remaps employee_ids to HCP's dispatched_employees:[{employee_id}] body shape
+ *         (was passing through and 400-ing). create_estimate auto-injects [{name:"Option 1"}]
+ *         if no options array supplied (HCP refuses empty estimates). convert_lead now POSTs
+ *         to /leads/{id}/convert (v2.8.0 mistakenly switched to PUT — the route is POST
+ *         per HCP docs) and remaps convert_to to body key type. Description fixes: removed
+ *         false "partial patch" claim from update_job_appointment; replaced wrong "sending []
+ *         wipes" example on the three bulk_update_* tools (HCP rejects [] arrays — the actual
+ *         risk is sending a SUBSET that deletes the omitted items); rewrote create_estimate
+ *         and create_lead descriptions; create_lead schema now requires customer_id (HCP
+ *         enforces). Append-only note on create_job_appointment response asymmetry. See
+ *         docs/evals/section-3-end-to-end-test-results.md for the test run that uncovered these.
+ *
+ * v3.4.4: Section 3 Tier 1 + Tier 2 — read-tool polish (15 tools). Description rewrites +
+ *         raw=true opt-out wired on list_employees, list_events, get_event, list_job_appointments,
+ *         list_job_line_items, list_job_invoices, list_job_input_materials, list_pricebook_services,
+ *         list_pricebook_materials, list_material_categories, list_tags, list_job_types,
+ *         list_lead_sources, list_pipeline_statuses, list_checklists. LIST_KEY expanded with
+ *         list_tags + list_pricebook_services + list_pricebook_materials so _pagination hint
+ *         applies. normalizePricebookPage now also bypassed by raw=true (was running
+ *         unconditionally — bug-fix so raw genuinely returns raw HCP shape).
+ *
+ * v3.4.3: Section 3 Tier 3 — write-tool description rewrites (P0+P1+P2+P3, ~33 tools).
+ *         Applied Principle 2.1/2.2 (3-4 sentence what/when/returns/caveats) to operational
+ *         hot-path writes (create_job, update_job_schedule, dispatch_job, etc.), the
+ *         estimate 3-step chain (create_estimate → option → bulk_update line items),
+ *         line-item edits with REPLACE-vs-PATCH semantics, and admin CRUD one-liners.
+ *         Documented the three schedule param conventions (create_job uses scheduled_start
+ *         + scheduled_end + arrival_window; update_job_schedule uses start_time + end_time
+ *         + arrival_window_in_minutes; create_job_appointment uses scheduled_start +
+ *         scheduled_end + arrival_window_minutes). No schema field changes — descriptions only.
+ *
+ * v3.4.2: Section 3 PR 3a.1+3a.2+partial 3a.3 — description rewrites + raw opt-out on 6
+ *         more read tools (list_invoices, get_invoice_by_uuid, list_customers, get_customer,
+ *         list_estimates, get_estimate, list_leads, get_lead). work_status enum extended
+ *         on list_estimates with production values.
+ *
+ * v3.4.1: Option B rollback of Section 2 field projection. Replaced per-tool whitelist
+ *         projector (PROJECTORS dict) with universal Tier-A recursive strip of 5 keys:
+ *         permissions (v3.1.0), company_name, company_id, avatar_url, color_hex. Verified
+ *         static across 60 customers (incl. 18 business records). Restored customer.email,
+ *         customer.kind, customer.notes, employee.email, employee.role, address.id, etc.
+ *         Kept all other v3.4.0 wins (annotations expanded, descriptions rewritten,
+ *         work_status enum additions, raw=true opt-out, _pagination hint, kill switch).
+ *         _pagination hint now applies to all 7 LIST_KEY-registered list tools, not just
+ *         list_jobs. raw=true now bypasses stripFields too (truly raw HCP response).
+ *
+ * v3.4.0: Section 2 pilot — apply MCP optimization principles to list_jobs + get_job.
+ *         Expanded READ/WRITE/DESTROY annotation constants to all 4 MCP hints.
+ *         Rewrote list_jobs + get_job descriptions (what/when/returns/caveats).
+ *         Added work_status enum values "complete unrated" + "user canceled".
+ *         Added raw=true opt-out, PROJECTORS dict, project() wiring, _pagination hint,
+ *         PROJECT_ENABLED env-var kill switch. Followup patch added top-level job.id to
+ *         projection so chain-from-list (list_jobs → get_job) works. See
+ *         docs/architecture/section-2-pilot-results.md for full Phase 1-4 record.
  *
  * v3.3.3: Fix create_job_appointment + update_job_appointment — remap scheduled_start/end
  *         to start_time/end_time (correct HCP API field names). Caught by smoke test.
@@ -101,13 +157,25 @@ async function hcp(apiKey, method, path, body) {
   return data;
 }
 
-function stripPermissions(obj) {
+// Strip universal Tier-A always-safe fields from any HCP response. Recursive,
+// removes named keys at any nesting depth. All values are either static identifiers
+// or UI-only presentation with ZERO information content:
+//   - permissions: HCP role permission objects (v3.1.0 strip, ~40% of response size)
+//   - company_name: Always your single HCP company name at every path it appears
+//                   (verified across all customer records including business records)
+//   - company_id:   Always the same UUID at every path
+//   - avatar_url:   Employee avatar image URL (UI presentation only)
+//   - color_hex:    Employee color label (UI presentation only)
+// raw=true bypasses this strip entirely (callers requesting the literal HCP response).
+const STRIP_FIELDS = ["permissions", "company_name", "company_id", "avatar_url", "color_hex"];
+
+function stripFields(obj, keys = STRIP_FIELDS) {
   if (!obj || typeof obj !== "object") return obj;
-  if (Array.isArray(obj)) return obj.map(stripPermissions);
+  if (Array.isArray(obj)) return obj.map(o => stripFields(o, keys));
   const out = {};
   for (const [k, v] of Object.entries(obj)) {
-    if (k === "permissions") continue;
-    out[k] = stripPermissions(v);
+    if (keys.includes(k)) continue;
+    out[k] = stripFields(v, keys);
   }
   return out;
 }
@@ -175,9 +243,24 @@ async function handleActivity(request, env, ctx) {
   }
 }
 
-const READ    = { readOnlyHint: true };
-const WRITE   = { readOnlyHint: false };
-const DESTROY = { readOnlyHint: false, destructiveHint: true };
+const READ = {
+  readOnlyHint:    true,
+  destructiveHint: false,
+  idempotentHint:  true,
+  openWorldHint:   true,  // worker hits HCP's external API
+};
+const WRITE = {
+  readOnlyHint:    false,
+  destructiveHint: false,  // create/update are additive
+  idempotentHint:  false,  // creates produce duplicates if retried
+  openWorldHint:   true,
+};
+const DESTROY = {
+  readOnlyHint:    false,
+  destructiveHint: true,
+  idempotentHint:  false,
+  openWorldHint:   true,
+};
 
 const TOOLS = [
 
@@ -186,70 +269,70 @@ const TOOLS = [
   // ════════════════════════════════════════════════════════════════════════════
 
   // ── Customers ─────────────────────────────────────────────────────────────
-  { name: "list_customers",                    annotations: READ,    description: "List or search customers",                                   inputSchema: { type: "object", properties: { q: { type: "string" }, page: { type: "number" }, page_size: { type: "number" }, sort_by: { type: "string", enum: ["created_at"], description: "Undocumented — confirmed working" }, sort_direction: { type: "string", enum: ["asc","desc"] }, expand: { type: "string" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." } } } },
-  { name: "get_customer",                      annotations: READ,    description: "Get a customer by ID",                                       inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string" }, expand: { type: "string" } } } },
+  { name: "list_customers",                    annotations: READ,    description: "List or search HCP customers by name, email, phone, or address (use the q parameter for free-text search). Returns full HCP customer records with all contact methods (email, mobile, home_number, work_number), kind (homeowner/business), company (the customer's actual business name, e.g. 'Acme Refrigeration Inc'), tags, addresses, lead_source, notes, etc. — with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Returns up to 10 records per page; use fetch_all=true for full datasets (fetch_all caps at ~2000 records). Pass raw=true for the complete unfiltered HCP response. Note: customer.company holds the actual business name; customer.company_name was stripped because it always references the HCP account holder, NOT the customer.",                                   inputSchema: { type: "object", properties: { q: { type: "string", description: "Free-text search across customer name, email, phone, address, and company. Case-insensitive substring match." }, page: { type: "number", description: "Page number (1-based). Default: 1." }, page_size: { type: "number", description: "Records per page. Default: 10. Use fetch_all=true for larger pulls." }, sort_by: { type: "string", enum: ["created_at"], description: "Undocumented — confirmed working" }, sort_direction: { type: "string", enum: ["asc","desc"] }, expand: { type: "string", description: "Optional sub-resources to include (rarely needed)." }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." }, raw: { type: "boolean", description: "Pass true to receive the complete unfiltered HCP response (including the 5 stripped always-safe fields and any permissions blob). Bypasses _pagination hint too." } } } },
+  { name: "get_customer",                      annotations: READ,    description: "Get a single customer by ID (cus_… prefix). Returns the same HCP record shape as list_customers records — full HCP fields with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). All contact methods preserved (email, mobile_number, home_number, work_number, company, kind). Use for chain-from-list patterns (after list_customers returns an id, or from list_jobs.customer.id / list_invoices.job_id chain). Pass raw=true for the complete unfiltered HCP response.",                                       inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string", description: "HCP customer ID (cus_… prefix), e.g. cus_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx." }, expand: { type: "string", description: "Optional sub-resources to include (rarely needed)." }, raw: { type: "boolean", description: "Pass true for the complete unfiltered HCP response (including the 5 stripped fields)." } } } },
   { name: "list_customer_addresses",           annotations: READ,    description: "List all addresses for a customer",                          inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string" } } } },
   { name: "get_customer_address",              annotations: READ,    description: "Get a specific address for a customer",                      inputSchema: { type: "object", required: ["customer_id","address_id"], properties: { customer_id: { type: "string" }, address_id: { type: "string" } } } },
   // ── Employees ─────────────────────────────────────────────────────────────
-  { name: "list_employees",                    annotations: READ,    description: "List all employees and technicians",                         inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." } } } },
+  { name: "list_employees",                    annotations: READ,    description: "List all employees on the HCP account — field techs, dispatchers, office staff. Returns pro_* IDs (used by dispatch_job, update_job_schedule.dispatched_employees, create_job_appointment.assigned_employee_ids), names, roles, contact info, tags. Small stable list (typically ~10 records); single page returns everything. Pass raw=true to bypass the Tier-A field strip and pricebook normalization.",                         inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." }, raw: { type: "boolean", description: "If true, bypass response transforms (Tier-A strip + pricebook normalization + pagination hint) and return the truly raw HCP response. Default false." } } } },
 
   // ── Jobs ──────────────────────────────────────────────────────────────────
-  { name: "list_jobs",                         annotations: READ,    description: "List or search jobs",                                        inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, work_status: { type: "array", items: { type: "string", enum: ["unscheduled","scheduled","in_progress","completed","canceled"] } }, scheduled_start_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_start_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T17:00:00Z" }, customer_id: { type: "string" }, employee_ids: { type: "array", items: { type: "string" } }, location_ids: { type: "array", items: { type: "string" }, description: "Filter by location IDs (multi-location companies)" }, sort_by: { type: "string", enum: ["created_at","updated_at","invoice_number","id","description","work_status"] }, sort_direction: { type: "string", enum: ["asc","desc"] }, expand: { type: "array", items: { type: "string", enum: ["attachments","appointments"] } }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." } } } },
-  { name: "get_job",                           annotations: READ,    description: "Get a job by ID",                                            inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" }, expand: { type: "string" } } } },
-  { name: "list_job_appointments",             annotations: READ,    description: "List appointments for a job",                                inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
-  { name: "list_job_line_items",               annotations: READ,    description: "List all line items for a job",                              inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
-  { name: "list_job_input_materials",          annotations: READ,    description: "List all input materials for a job",                         inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
-  { name: "list_job_invoices",                 annotations: READ,    description: "List invoices for a job",                                    inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
+  { name: "list_jobs",                         annotations: READ,    description: "List or search jobs in HCP. Returns the full HCP job record (customer with all contact info, address, notes, assigned employees, schedule, work timestamps, tags, job type, financial totals, lead source, status timestamps, recurring rule, etc.) with 5 always-safe fields stripped recursively: permissions, company_name, company_id, avatar_url, color_hex — all static identifiers or UI presentation with zero information content. Filter by employee_ids, customer_id, work_status, or scheduled_start date range. Use to find today's schedule, look up jobs by status or date range, filter by technician, or pull all jobs for a customer. Returns up to 10 records per page by default; use fetch_all=true for full datasets (max ~2000 records). Cannot filter by zip, tag, or job_type via API — apply those filters client-side after retrieving. Pass raw=true for the complete unfiltered HCP response (including the 5 stripped fields and a permissions blob). Money: total_amount and outstanding_balance are in cents (divide by 100 for dollars).", inputSchema: { type: "object", properties: { page: { type: "number", description: "Page number (1-based). Default: 1." }, page_size: { type: "number", description: "Records per page. Default: 10. Max safe value: 10 (worker-side cap). Use fetch_all=true for larger pulls." }, work_status: { type: "array", items: { type: "string", enum: ["unscheduled","scheduled","in_progress","completed","complete unrated","canceled","user canceled"] }, description: "Filter by job status. Pass multiple values as array, e.g. [\"scheduled\",\"in_progress\"] for active jobs. Note: HCP responses commonly use 'complete unrated' (default for completed jobs) and 'user canceled' (customer-initiated cancellation) rather than 'completed' / 'canceled' — use the variants if you want real results." }, scheduled_start_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_start_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T17:00:00Z" }, customer_id: { type: "string", description: "HCP customer ID (cus_… prefix), e.g. cus_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx. Returns all jobs for this customer across all statuses." }, employee_ids: { type: "array", items: { type: "string" }, description: "Array of HCP employee IDs (pro_… prefix), e.g. [\"pro_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"]. Returns jobs assigned to any of the specified employees." }, location_ids: { type: "array", items: { type: "string" }, description: "Filter by location IDs (multi-location companies)" }, sort_by: { type: "string", enum: ["created_at","updated_at","invoice_number","id","description","work_status"] }, sort_direction: { type: "string", enum: ["asc","desc"] }, expand: { type: "array", items: { type: "string", enum: ["attachments","appointments"] } }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." }, raw: { type: "boolean", description: "Pass true to receive the full unfiltered HCP response (all 28 fields per job) instead of the projected field subset. Use when you need fields not in the default projection." } } } },
+  { name: "get_job",                           annotations: READ,    description: "Get a single job by ID (job_… prefix). Returns the same HCP record shape as list_jobs records — full HCP fields with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Use for chain-from-list patterns (e.g., after list_jobs returns a job ID). Pass raw=true for the complete unfiltered HCP response. Money fields are in cents (divide by 100 for dollars).", inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string", description: "HCP job ID (job_… prefix), e.g. job_afaa6d7b0f3e40318d548489c162dee1." }, expand: { type: "string", description: "Optional sub-resources to include (rarely needed)." }, raw: { type: "boolean", description: "Pass true for the full unprojected HCP response (all 28 fields)." } } } },
+  { name: "list_job_appointments",             annotations: READ,    description: "List all appointments scheduled on a job (a job can have multiple time slots — install + recheck, diagnostic + repair). Required: job_id. Returns a BARE ARRAY (no pagination wrapper, no _pagination hint). Use to inspect what's already scheduled before calling update_job_appointment or create_job_appointment. Pass raw=true to bypass Tier-A field strip.",                                inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
+  { name: "list_job_line_items",               annotations: READ,    description: "List all invoice line items on a job. Required: job_id. Returns a BARE ARRAY (no pagination wrapper). MUST be called first if you want to append a line item via bulk_update_job_line_items (which REPLACES the full list) — read current items, append yours, send the full combined array. Money fields (unit_price, unit_cost) are in CENTS. Pass raw=true to bypass Tier-A strip.",                              inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
+  { name: "list_job_input_materials",          annotations: READ,    description: "List all input materials (parts consumed) on a job — separate from invoice line items; drives cost-of-job tracking. Required: job_id. Returns a BARE ARRAY. MUST be called first if you want to append a material via bulk_update_job_input_materials (which REPLACES the full list). unit_cost is in CENTS.",                         inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
+  { name: "list_job_invoices",                 annotations: READ,    description: "List all invoices generated for a job. Required: job_id. Returns a BARE ARRAY. Money fields: amount/subtotal in CENTS, but due_amount in DOLLARS (HCP API inconsistency — same gotcha as get_invoice_by_uuid). Use get_invoice_by_uuid for the full invoice detail of a specific invoice UUID returned here.",                                    inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
   // ── Estimates ─────────────────────────────────────────────────────────────
-  { name: "list_estimates",                    annotations: READ,    description: "List or search estimates",                                   inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, customer_id: { type: "string" }, work_status: { type: "array", items: { type: "string", enum: ["unscheduled","scheduled","in_progress","completed","canceled"] } }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." } } } },
-  { name: "get_estimate",                      annotations: READ,    description: "Get an estimate by ID",                                      inputSchema: { type: "object", required: ["estimate_id"], properties: { estimate_id: { type: "string" } } } },
+  { name: "list_estimates",                    annotations: READ,    description: "List or search HCP estimates. Filter by customer_id or work_status. Returns full HCP estimate records (customer, address, options with line items + notes, schedule, assigned employees, lead_source, etc.) with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Returns up to 10 records per page; use fetch_all=true for full datasets (corpus is 1,207+ estimates). Pass raw=true for the complete unfiltered HCP response. **work_status enum note:** schema lists generic values but HCP responses commonly use 'pro canceled', 'needs scheduling', 'created job from estimate', 'user canceled' — these variants are added to the enum and usable in the filter. Customer info IS included in each estimate record (unlike list_invoices which only returns job_id).",                                   inputSchema: { type: "object", properties: { page: { type: "number", description: "Page number (1-based). Default: 1." }, page_size: { type: "number", description: "Records per page. Default: 10. Use fetch_all=true for larger pulls." }, customer_id: { type: "string", description: "HCP customer ID (cus_… prefix). Returns all estimates for this customer." }, work_status: { type: "array", items: { type: "string", enum: ["unscheduled","scheduled","in_progress","completed","canceled","pro canceled","needs scheduling","created job from estimate","user canceled"] }, description: "Filter by estimate status. Pass multiple as array. Note: HCP responses commonly use the variants 'pro canceled', 'needs scheduling', 'created job from estimate', 'user canceled' — use these if you want real production results." }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." }, raw: { type: "boolean", description: "Pass true to receive the complete unfiltered HCP response (including the 5 stripped fields). Bypasses _pagination hint too." } } } },
+  { name: "get_estimate",                      annotations: READ,    description: "Get a single estimate by ID (csr_… prefix). Returns the same HCP record shape as list_estimates records — full HCP fields with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Customer, address, options with line items + notes, schedule all preserved. Use for chain-from-list patterns (after list_estimates returns an id). Pass raw=true for the complete unfiltered HCP response.",                                      inputSchema: { type: "object", required: ["estimate_id"], properties: { estimate_id: { type: "string", description: "HCP estimate ID (csr_… prefix), e.g. csr_a6dd80e33b3748e5bdfb9bc308a3ed01." }, raw: { type: "boolean", description: "Pass true for the complete unfiltered HCP response (including the 5 stripped fields)." } } } },
   { name: "list_estimate_option_line_items",   annotations: READ,    description: "List line items for an estimate option",                     inputSchema: { type: "object", required: ["estimate_id","option_id"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" } } } },
 
   // ── Invoices ──────────────────────────────────────────────────────────────
-  { name: "list_invoices",                     annotations: READ,    description: "List invoices account-wide",                                 inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, status: { type: "array", items: { type: "string", enum: ["open","pending_payment","paid","voided","uncollectible","canceled"] } }, customer_uuid: { type: "string" }, created_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, created_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, paid_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, paid_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, due_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, due_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, amount_due_min: { type: "number", description: "Minimum amount due in cents" }, amount_due_max: { type: "number", description: "Maximum amount due in cents" }, payment_method: { type: "array", items: { type: "string", enum: ["consumer_financing","credit_card","ach","external","mobile_check_deposit"] } }, sort_by: { type: "string", enum: ["amount","created_at","due_amount","due_at","invoice_number","paid_at","sent_at","status","updated_at"] }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." } } } },
-  { name: "get_invoice_by_uuid",               annotations: READ,    description: "Get an invoice by UUID",                                     inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
+  { name: "list_invoices",                     annotations: READ,    description: "List or search invoices in HCP. Filter by status, customer_uuid, payment_method, or date ranges (created_at, paid_at, due_at) or amount_due. Returns the full HCP invoice record (status, amount, due_amount, due_at, paid_at, sent_at, service_date, line items, payments, refunds, job_id for chaining, etc.) with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex — zero info loss). Returns up to 10 records per page by default; use fetch_all=true for full datasets (corpus is 12,318+ invoices; fetch_all caps at ~2000). Pass raw=true for the complete unfiltered HCP response. **Money quirk:** response 'amount' and 'subtotal' fields are in CENTS (divide by 100 for dollars); response 'due_amount' field is in DOLLARS (NOT cents — HCP API inconsistency verified in production). Use 'job_id' to chain to list_jobs/get_job for customer name lookup (list_invoices does not return customer details directly).",                                 inputSchema: { type: "object", properties: { page: { type: "number", description: "Page number (1-based). Default: 1." }, page_size: { type: "number", description: "Records per page. Default: 10. Max safe value: 30 (worker-side ceiling). Use fetch_all=true for larger pulls." }, status: { type: "array", items: { type: "string", enum: ["open","pending_payment","paid","voided","uncollectible","canceled"] }, description: "Filter by invoice status. Pass multiple as array, e.g. [\"open\",\"pending_payment\"] for outstanding AR." }, customer_uuid: { type: "string", description: "HCP customer ID (cus_… prefix), e.g. cus_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx. Returns all invoices for this customer." }, created_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, created_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, paid_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, paid_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, due_at_min: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T00:00:00Z" }, due_at_max: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T23:59:59Z" }, amount_due_min: { type: "number", description: "Minimum amount due in cents (filter param uses cents even though response due_amount is in dollars)" }, amount_due_max: { type: "number", description: "Maximum amount due in cents (filter param uses cents even though response due_amount is in dollars)" }, payment_method: { type: "array", items: { type: "string", enum: ["consumer_financing","credit_card","ach","external","mobile_check_deposit"] }, description: "Filter by payment method. Multiple values allowed." }, sort_by: { type: "string", enum: ["amount","created_at","due_amount","due_at","invoice_number","paid_at","sent_at","status","updated_at"] }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." }, raw: { type: "boolean", description: "Pass true to receive the complete unfiltered HCP response (including the 5 stripped always-safe fields and any permissions blob). Bypasses _pagination hint too." } } } },
+  { name: "get_invoice_by_uuid",               annotations: READ,    description: "Get a single invoice by its UUID (invoice_… prefix). Returns the same HCP record shape as list_invoices records — full HCP fields with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Use for chain-from-list patterns (after list_invoices returns an id). Pass raw=true for the complete unfiltered HCP response. **Money:** amount and subtotal in cents; due_amount in DOLLARS (HCP API quirk). Use job_id from the response to chain to list_jobs/get_job for customer lookup.",                                     inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string", description: "HCP invoice UUID (invoice_… prefix), e.g. invoice_5efc5de64e2d486d9b97efb859d094a6." }, raw: { type: "boolean", description: "Pass true for the complete unfiltered HCP response (including the 5 stripped fields)." } } } },
   { name: "preview_invoice",                   annotations: READ,    description: "DEPRECATED — returns raw HTML blob, not structured data. Use get_invoice_by_uuid instead.", inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
 
   // ── Leads ─────────────────────────────────────────────────────────────────
-  { name: "list_leads",                        annotations: READ,    description: "List or search leads",                                       inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, status: { type: "string", enum: ["open","won","lost"] }, customer_id: { type: "string" }, lead_source: { type: "string" }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." } } } },
-  { name: "get_lead",                          annotations: READ,    description: "Get a lead by ID",                                           inputSchema: { type: "object", required: ["lead_id"], properties: { lead_id: { type: "string" } } } },
+  { name: "list_leads",                        annotations: READ,    description: "List or search HCP leads (pipeline opportunities — distinct from jobs and estimates). Filter by status (open/won/lost), customer_id, or lead_source. Returns full HCP lead records with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Returns up to 10 records per page; use fetch_all=true for full datasets. Pass raw=true for the complete unfiltered HCP response. Use to find new pipeline opportunities (status=open), recently won deals, or all leads from a specific source. Status=lost in HCP means full automation + manual cycle done — never re-engage these.",                                       inputSchema: { type: "object", properties: { page: { type: "number", description: "Page number (1-based). Default: 1." }, page_size: { type: "number", description: "Records per page. Default: 10. Use fetch_all=true for larger pulls." }, status: { type: "string", enum: ["open","won","lost"], description: "Lead pipeline status. Open = active opportunity. Won = converted to job/sale. Lost = dead lead (do not re-engage)." }, customer_id: { type: "string", description: "HCP customer ID (cus_… prefix). Returns all leads for this customer." }, lead_source: { type: "string", description: "Filter by lead source string (e.g. 'Google', 'Referral', 'Angi')." }, sort_direction: { type: "string", enum: ["asc","desc"] }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Use page+page_size for larger datasets." }, raw: { type: "boolean", description: "Pass true to receive the complete unfiltered HCP response (including the 5 stripped fields). Bypasses _pagination hint too." } } } },
+  { name: "get_lead",                          annotations: READ,    description: "Get a single lead by ID (lead_… prefix). Returns the same HCP record shape as list_leads records — full HCP fields with 5 always-safe fields stripped (permissions, company_name, company_id, avatar_url, color_hex). Use for chain-from-list patterns (after list_leads returns a lead_id). Pass raw=true for the complete unfiltered HCP response.",                                           inputSchema: { type: "object", required: ["lead_id"], properties: { lead_id: { type: "string", description: "HCP lead ID (lead_… prefix)." }, raw: { type: "boolean", description: "Pass true for the complete unfiltered HCP response (including the 5 stripped fields)." } } } },
   { name: "list_lead_line_items",              annotations: READ,    description: "List line items for a lead",                                 inputSchema: { type: "object", required: ["lead_id"], properties: { lead_id: { type: "string" } } } },
 
   // ── Lead Sources ──────────────────────────────────────────────────────────
-  { name: "list_lead_sources",                 annotations: READ,    description: "List all lead sources",                                      inputSchema: { type: "object", properties: { q: { type: "string" }, page: { type: "number" } } } },
+  { name: "list_lead_sources",                 annotations: READ,    description: "List all lead source attribution options available on this HCP account (e.g. 'Google Ads', 'Referral', 'Yelp'). Returns id + name. Use BEFORE create_lead / create_estimate / create_customer to pick a valid lead_source string (must match exactly — invalid strings are silently dropped). Small stable list; no fetch_all needed.",                                      inputSchema: { type: "object", properties: { q: { type: "string", description: "Optional filter by name substring" }, page: { type: "number" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
   // ── Tags ──────────────────────────────────────────────────────────────────
-  { name: "list_tags",                         annotations: READ,    description: "List all tags",                                              inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." } } } },
+  { name: "list_tags",                         annotations: READ,    description: "List all tags defined on the HCP account (used for jobs and customers). Returns tag_id + name pairs. Use BEFORE add_job_tag to look up an existing tag name (note: add_job_tag takes the TAG STRING, not the tag_id — that's a separate quirk). Supports fetch_all if the library is large.",                                              inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
   // ── Job Types ─────────────────────────────────────────────────────────────
-  { name: "list_job_types",                    annotations: READ,    description: "List job type categories",                                   inputSchema: { type: "object", properties: { name: { type: "string" } } } },
+  { name: "list_job_types",                    annotations: READ,    description: "List all job type classifications defined on the HCP account (e.g. 'AC Install', 'Maintenance', 'Service Call', 'Warranty'). Returns job_type_id + name. Use BEFORE create_job to look up a valid job_type_id. Small stable list — no pagination needed.",                                   inputSchema: { type: "object", properties: { name: { type: "string", description: "Optional filter by name substring" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
   // ── Pricebook ─────────────────────────────────────────────────────────────
-  { name: "list_pricebook_services",           annotations: READ,    description: "List pricebook services",                                    inputSchema: { type: "object", properties: { page: { type: "number" }, q: { type: "string" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." } } } },
-  { name: "list_pricebook_materials",          annotations: READ,    description: "List pricebook materials",                                   inputSchema: { type: "object", properties: { page: { type: "number" }, material_category_uuid: { type: "string", description: "Required for filtering by category. Call list_material_categories first." }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." } } } },
-  { name: "list_material_categories",          annotations: READ,    description: "List material categories",                                   inputSchema: { type: "object", properties: { page: { type: "number" } } } },
-  { name: "list_price_forms",                  annotations: READ,    description: "List price forms",                                           inputSchema: { type: "object", properties: {} } },
+  { name: "list_pricebook_services",           annotations: READ,    description: "List pricebook services (labor SKUs used on jobs and estimates). Returns id + name + unit_price + unit_cost (CENTS — 15000 = $150.00). Filter by name substring via q. Read-only via this worker — create/update/delete services in the HCP dashboard. Response is normalized to {items, total_items, total_pages} from HCP's native {data, total_count, total_pages_count} (raw=true returns HCP's native shape).",                                    inputSchema: { type: "object", properties: { page: { type: "number" }, q: { type: "string", description: "Filter by name substring" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." }, raw: { type: "boolean", description: "If true, bypass Tier-A strip AND pricebook normalization — returns HCP's native {data, total_count, total_pages_count} shape with full unfiltered fields. Default false." } } } },
+  { name: "list_pricebook_materials",          annotations: READ,    description: "List pricebook materials (parts SKUs you stock and resell). Returns id + name + unit_price + unit_cost (CENTS) + material_category_uuid. material_category_uuid filter is REQUIRED for listing materials — call list_material_categories FIRST to get valid UUIDs. Response is normalized to {items, total_items, total_pages} from HCP's native shape (raw=true returns native).",                                   inputSchema: { type: "object", properties: { page: { type: "number" }, material_category_uuid: { type: "string", description: "REQUIRED for filtering by category. Call list_material_categories first to get valid UUIDs." }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records)." }, raw: { type: "boolean", description: "If true, bypass Tier-A strip AND pricebook normalization. Default false." } } } },
+  { name: "list_material_categories",          annotations: READ,    description: "List all material categories defined on the HCP account (e.g. 'Refrigerant', 'Fittings', 'Electrical'). Returns uuid + name. Use BEFORE list_pricebook_materials (which REQUIRES a material_category_uuid filter — there's no list-all-materials endpoint).",                                   inputSchema: { type: "object", properties: { page: { type: "number" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
+  { name: "list_price_forms",                  annotations: READ,    description: "List all price forms. No filter params — returns full set.",                                           inputSchema: { type: "object", properties: {} } },
   { name: "get_price_form",                    annotations: READ,    description: "Get a price form by UUID",                                   inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
 
   // ── Events & Schedule ─────────────────────────────────────────────────────
-  { name: "list_events",                       annotations: READ,    description: "List calendar events. HCP API sorts by created_at by default; use sort_by=start_time&sort_direction=desc + fetch_all + start_time_min/max to surface upcoming/today events (desc sort puts future events first so they land within the fetch_all window). start_time_min/max are client-side filters applied after fetch.", inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, sort_by: { type: "string", enum: ["start_time","name"], description: "Undocumented — confirmed working. Use start_time+desc to get upcoming events first." }, sort_direction: { type: "string", enum: ["asc","desc"] }, start_time_min: { type: "string", description: "ISO 8601 datetime — client-side filter, e.g. 2025-01-15T00:00:00Z" }, start_time_max: { type: "string", description: "ISO 8601 datetime — client-side filter, e.g. 2025-01-15T23:59:59Z" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Combine with sort_by=start_time&sort_direction=desc for date-scoped results." } } } },
-  { name: "get_event",                         annotations: READ,    description: "Get a calendar event by ID",                                 inputSchema: { type: "object", required: ["event_id"], properties: { event_id: { type: "string" } } } },
+  { name: "list_events",                       annotations: READ,    description: "List calendar events (HCP's company-level event calendar — NOT job appointments; for those use list_job_appointments). CAVEAT: HCP API sorts by created_at by default, so fetching today's events naively misses upcoming work. To surface today/upcoming events reliably, use sort_by=start_time + sort_direction=desc + fetch_all + start_time_min/max — desc sort puts future events first so they land within the fetch_all 20-page cap. start_time_min/max are CLIENT-SIDE filters applied AFTER fetch (not pushed to HCP).", inputSchema: { type: "object", properties: { page: { type: "number" }, page_size: { type: "number" }, sort_by: { type: "string", enum: ["start_time","name"], description: "Undocumented but confirmed working. Use start_time+desc to get upcoming events first." }, sort_direction: { type: "string", enum: ["asc","desc"] }, start_time_min: { type: "string", description: "ISO 8601 datetime — client-side filter, e.g. 2025-01-15T00:00:00Z" }, start_time_max: { type: "string", description: "ISO 8601 datetime — client-side filter, e.g. 2025-01-15T23:59:59Z" }, fetch_all: { type: "boolean", description: "Auto-fetch all pages (max 20 pages / ~2000 records). Combine with sort_by=start_time&sort_direction=desc for date-scoped results." }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
+  { name: "get_event",                         annotations: READ,    description: "Get a single calendar event by ID. Required: event_id. Returns the full event record — name, schedule (start_time/end_time), assigned employees, notes, recurrence info if applicable. Use after list_events to drill into a specific event.",                                 inputSchema: { type: "object", required: ["event_id"], properties: { event_id: { type: "string" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
   { name: "get_schedule_availability",         annotations: READ,    description: "Get company schedule availability",                          inputSchema: { type: "object", properties: {} } },
-  { name: "get_booking_windows",               annotations: READ,    description: "Get available booking windows",                              inputSchema: { type: "object", properties: { show_for_days: { type: "number" }, start_date: { type: "string", description: "Date in YYYY-MM-DD format, e.g. 2025-01-15" }, employee_ids: { type: "array", items: { type: "string" } } } } },
+  { name: "get_booking_windows",               annotations: READ,    description: "Get available appointment slots for booking. Filter by employee_ids, start_date, or show_for_days.",                              inputSchema: { type: "object", properties: { show_for_days: { type: "number" }, start_date: { type: "string", description: "Date in YYYY-MM-DD format, e.g. 2025-01-15" }, employee_ids: { type: "array", items: { type: "string" } } } } },
 
   // ── Dispatch ──────────────────────────────────────────────────────────────
-  { name: "list_routes",                       annotations: READ,    description: "List dispatch routes",                                       inputSchema: { type: "object", properties: { date: { type: "string", description: "Date in YYYY-MM-DD format, e.g. 2025-01-15" }, page: { type: "number" } } } },
-  { name: "list_service_zones",                annotations: READ,    description: "List service zones",                                         inputSchema: { type: "object", properties: { page: { type: "number" }, zip_code: { type: "string" } } } },
+  { name: "list_routes",                       annotations: READ,    description: "List dispatch routes for a given date (date param required; YYYY-MM-DD). Supports pagination.",                                       inputSchema: { type: "object", properties: { date: { type: "string", description: "Date in YYYY-MM-DD format, e.g. 2025-01-15" }, page: { type: "number" } } } },
+  { name: "list_service_zones",                annotations: READ,    description: "List service zones, optionally filtered by zip_code. Supports pagination.",                                         inputSchema: { type: "object", properties: { page: { type: "number" }, zip_code: { type: "string" } } } },
 
   // ── Pipeline ──────────────────────────────────────────────────────────────
-  { name: "list_pipeline_statuses",            annotations: READ,    description: "List pipeline statuses",                                     inputSchema: { type: "object", required: ["resource_type"], properties: { resource_type: { type: "string", enum: ["lead","job","estimate"], description: "Resource type to retrieve pipeline statuses for" }, page: { type: "number" } } } },
+  { name: "list_pipeline_statuses",            annotations: READ,    description: "List pipeline status records for a resource type (lead, job, or estimate). Required: resource_type. Returns status records with id (kcs_*), name, and status_type — needed for update_pipeline_status calls. CAVEAT: HCP returns 2 pages by default — fetch BOTH if you need the full set. Pipeline is FORWARD-ONLY (update_pipeline_status only moves a record to a target with order equal or higher). Run for each resource_type once and store the kcs_* IDs in your own reference (the template's examples/claude-memory/hcp_full.md shows the table structure).",                                     inputSchema: { type: "object", required: ["resource_type"], properties: { resource_type: { type: "string", enum: ["lead","job","estimate"], description: "Resource type to retrieve pipeline statuses for" }, page: { type: "number" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
   // ── Company ───────────────────────────────────────────────────────────────
   { name: "get_company",                       annotations: READ,    description: "Get company account information",                            inputSchema: { type: "object", properties: {} } },
 
   // ── Checklists ────────────────────────────────────────────────────────────
-  { name: "list_checklists",                   annotations: READ,    description: "List checklists for jobs or estimates",                      inputSchema: { type: "object", properties: { page: { type: "number" }, job_uuids: { type: "array", items: { type: "string" } } } } },
+  { name: "list_checklists",                   annotations: READ,    description: "List job checklists (work-completion checklists assigned to jobs). CAVEAT: in practice job_uuids array filter is REQUIRED to get useful results — calling without it returns inconsistent / empty data per the memory file. Pass job_uuids: [\"job_*\", ...] to scope to specific jobs.",                      inputSchema: { type: "object", properties: { page: { type: "number" }, job_uuids: { type: "array", items: { type: "string" }, description: "REQUIRED in practice — array of job_* IDs to scope the checklist query to" }, raw: { type: "boolean", description: "If true, bypass response transforms and return the truly raw HCP response. Default false." } } } },
 
 
 
@@ -259,80 +342,156 @@ const TOOLS = [
   // ════════════════════════════════════════════════════════════════════════════
 
   // ── Customers ─────────────────────────────────────────────────────────────
-  { name: "create_customer",                   annotations: WRITE,   description: "Create a new customer",                                      inputSchema: { type: "object", required: ["first_name","last_name"], properties: { first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, home_number: { type: "string" }, work_number: { type: "string" }, company: { type: "string" }, notifications_enabled: { type: "boolean" }, lead_source: { type: "string" }, notes: { type: "string" } } } },
-  { name: "update_customer",                   annotations: WRITE,   description: "Update a customer",                                          inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string" }, first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, company: { type: "string" }, notifications_enabled: { type: "boolean" }, lead_source: { type: "string" }, notes: { type: "string" } } } },
-  { name: "create_customer_address",           annotations: WRITE,   description: "Add a service address to a customer",                        inputSchema: { type: "object", required: ["customer_id","street","city","state","zip"], properties: { customer_id: { type: "string" }, street: { type: "string" }, street_line_2: { type: "string" }, city: { type: "string" }, state: { type: "string" }, zip: { type: "string" }, country: { type: "string" } } } },
+  { name: "create_customer",                   annotations: WRITE,   description: "Create a new customer record (residential or business). Required: first_name + last_name. Customer is created with NO addresses — call create_customer_address afterward to attach a service location before booking a job. The optional 'company' field is the customer's actual business name (e.g. 'Acme Refrigeration Inc'); this is distinct from the always-static company_name field that the worker strips from responses.", inputSchema: { type: "object", required: ["first_name","last_name"], properties: { first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, home_number: { type: "string" }, work_number: { type: "string" }, company: { type: "string", description: "Customer's business name if commercial (e.g. 'Acme Refrigeration Inc'). Leave empty for residential." }, notifications_enabled: { type: "boolean", description: "false silences ALL future SMS/email to this customer from HCP (account-wide flag)" }, lead_source: { type: "string" }, notes: { type: "string" } } } },
+  { name: "update_customer",                   annotations: WRITE,   description: "Update fields on an existing customer record. Required: customer_id (cus_*). Partial patch — send only the fields you want to change; omitted fields are preserved (this IS a partial patch, unlike bulk_update_* tools). Use notifications_enabled=false to silence ALL future SMS/email to this customer (account-wide flag).", inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string", description: "Customer ID from list_customers, e.g. cus_abc123" }, first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, company: { type: "string" }, notifications_enabled: { type: "boolean" }, lead_source: { type: "string" }, notes: { type: "string" } } } },
+  { name: "create_customer_address",           annotations: WRITE,   description: "Attach a service address to an existing customer. Required: customer_id + street + city + state + zip. Returns the new address object — capture address_id for create_job/create_estimate (those tools require an address_id that belongs to the same customer). A customer can have multiple addresses; list_customer_addresses returns all of them.", inputSchema: { type: "object", required: ["customer_id","street","city","state","zip"], properties: { customer_id: { type: "string" }, street: { type: "string" }, street_line_2: { type: "string" }, city: { type: "string" }, state: { type: "string", description: "Two-letter state code, e.g. 'FL'" }, zip: { type: "string" }, country: { type: "string", description: "Defaults to 'US' if omitted" } } } },
 
   // ── Jobs ──────────────────────────────────────────────────────────────────
-  { name: "create_job",                        annotations: WRITE,   description: "Create a new job",                                           inputSchema: { type: "object", required: ["customer_id","address_id"], properties: { customer_id: { type: "string" }, address_id: { type: "string" }, invoice_number: { type: "number" }, notes: { type: "string" }, lead_source: { type: "string" }, job_type_id: { type: "string" }, tags: { type: "array", items: { type: "string" } }, assigned_employee_ids: { type: "array", items: { type: "string" } }, schedule: { type: "object", description: "Optional schedule at creation time", properties: { scheduled_start: { type: "string", description: "ISO 8601, e.g. 2025-01-15T09:00:00" }, scheduled_end: { type: "string", description: "ISO 8601, e.g. 2025-01-15T11:00:00" }, arrival_window: { type: "number", description: "Arrival window in minutes" }, anytime: { type: "boolean" } } } } } },
-  { name: "dispatch_job",                      annotations: WRITE,   description: "Dispatch a job to specific employees",                       inputSchema: { type: "object", required: ["job_id","employee_ids"], properties: { job_id: { type: "string" }, employee_ids: { type: "array", items: { type: "string" } } } } },
+  { name: "create_job",                        annotations: WRITE,   description: "Create a new job for a customer. Required: customer_id + address_id — address_id MUST come from get_customer or list_customer_addresses for this same customer; the wrong address_id silently creates the job at the wrong location. Returns the full job object (use returned job.id for follow-up calls). CAVEAT: the optional schedule sub-object uses scheduled_start/scheduled_end/arrival_window (in minutes) — DIFFERENT param names than update_job_schedule (start_time/end_time/arrival_window_in_minutes) and create_job_appointment (scheduled_start/scheduled_end/arrival_window_minutes). Use update_job_schedule afterward to change scheduling.", inputSchema: { type: "object", required: ["customer_id","address_id"], properties: { customer_id: { type: "string", description: "Customer ID from list_customers, e.g. cus_abc123" }, address_id: { type: "string", description: "Address ID from get_customer.addresses[].id or list_customer_addresses — must belong to this customer" }, invoice_number: { type: "number" }, notes: { type: "string" }, lead_source: { type: "string" }, job_type_id: { type: "string" }, tags: { type: "array", items: { type: "string" } }, assigned_employee_ids: { type: "array", items: { type: "string" } }, schedule: { type: "object", description: "Optional schedule at creation time. Uses scheduled_*/arrival_window naming (NOT start_time/_in_minutes)", properties: { scheduled_start: { type: "string", description: "ISO 8601, e.g. 2025-01-15T09:00:00" }, scheduled_end: { type: "string", description: "ISO 8601, e.g. 2025-01-15T11:00:00" }, arrival_window: { type: "number", description: "Arrival window in minutes, e.g. 30, 60, 120" }, anytime: { type: "boolean" } } } } } },
+  { name: "dispatch_job",                      annotations: WRITE,   description: "Assign one or more employees to a job and push the dispatch through HCP mobile app notification. Required: job_id + employee_ids (array of pro_* IDs from list_employees). Triggers app notification to each employee immediately. If you also need to set scheduling at the same time, use update_job_schedule with the dispatched_employees param instead — it does both in one call.", inputSchema: { type: "object", required: ["job_id","employee_ids"], properties: { job_id: { type: "string" }, employee_ids: { type: "array", items: { type: "string", description: "Employee ID, e.g. pro_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx" } } } } },
   { name: "lock_job",                          annotations: WRITE,   description: "Lock a single job",                                          inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
-  { name: "lock_jobs",                         annotations: WRITE,   description: "Lock all completed or scheduled jobs within a time range",   inputSchema: { type: "object", required: ["starting_at","ending_at"], properties: { starting_at: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-01T00:00:00Z" }, ending_at: { type: "string", description: "ISO 8601 datetime, e.g. 2025-03-31T23:59:59Z" } } } },
-  { name: "update_job_schedule",               annotations: WRITE,   description: "Update the schedule for a job. notify/notify_pro fire immediately at scheduling time, not at job completion.", inputSchema: { type: "object", required: ["job_id","start_time"], properties: { job_id: { type: "string" }, start_time: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00" }, end_time: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00" }, arrival_window_in_minutes: { type: "number", description: "Arrival window in minutes, e.g. 30, 60, 120" }, notify: { type: "boolean", description: "Send booking confirmation SMS/email to customer immediately" }, notify_pro: { type: "boolean", description: "Send booking confirmation to assigned employee immediately" }, dispatched_employees: { type: "array", items: { type: "object", properties: { employee_id: { type: "string" } } }, description: "Employees to dispatch to this job" } } } },
+  { name: "lock_jobs",                         annotations: WRITE,   description: "Lock all completed or scheduled jobs within a time range (starting_at/ending_at required, ISO 8601). Irreversible batch operation.",   inputSchema: { type: "object", required: ["starting_at","ending_at"], properties: { starting_at: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-01T00:00:00Z" }, ending_at: { type: "string", description: "ISO 8601 datetime, e.g. 2025-03-31T23:59:59Z" } } } },
+  { name: "update_job_schedule",               annotations: WRITE,   description: "Update the schedule for an existing job (primary visit). Use AFTER create_job to set or change scheduling. Required: job_id + start_time. CAVEAT: param names differ from sibling tools — uses start_time/end_time/arrival_window_in_minutes (NOT scheduled_start/scheduled_end/arrival_window like create_job, and NOT _minutes like create_job_appointment). notify=true sends SMS+email to customer immediately at scheduling time (NOT at job completion); notify_pro=true does the same for the assigned employee.", inputSchema: { type: "object", required: ["job_id","start_time"], properties: { job_id: { type: "string" }, start_time: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00" }, end_time: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00" }, arrival_window_in_minutes: { type: "number", description: "Arrival window in minutes, e.g. 30, 60, 120" }, notify: { type: "boolean", description: "Send booking confirmation SMS/email to customer immediately at scheduling time" }, notify_pro: { type: "boolean", description: "Send booking confirmation to assigned employee immediately" }, dispatched_employees: { type: "array", items: { type: "object", properties: { employee_id: { type: "string", description: "Employee ID from list_employees, e.g. pro_abc123" } } }, description: "Employees to dispatch to this job. Each item: {employee_id: 'pro_*'}" } } } },
   { name: "delete_job_schedule",               annotations: DESTROY, description: "Remove the schedule from a job",                             inputSchema: { type: "object", required: ["job_id"], properties: { job_id: { type: "string" } } } },
-  { name: "create_job_appointment",            annotations: WRITE,   description: "Schedule an appointment for a job",                          inputSchema: { type: "object", required: ["job_id","scheduled_start","scheduled_end"], properties: { job_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z" }, arrival_window_minutes: { type: "number" }, assigned_employee_ids: { type: "array", items: { type: "string" } }, dispatcher_note: { type: "string" }, notify_customer: { type: "boolean" } } } },
-  { name: "update_job_appointment",            annotations: WRITE,   description: "Update a job appointment",                                   inputSchema: { type: "object", required: ["job_id","appointment_id"], properties: { job_id: { type: "string" }, appointment_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z" }, assigned_employee_ids: { type: "array", items: { type: "string" } }, notify_customer: { type: "boolean" } } } },
-  { name: "delete_job_appointment",            annotations: DESTROY, description: "Delete a job appointment",                                   inputSchema: { type: "object", required: ["job_id","appointment_id"], properties: { job_id: { type: "string" }, appointment_id: { type: "string" }, notify_customer: { type: "boolean" } } } },
-  { name: "create_job_note",                   annotations: WRITE,   description: "Add a note to a job",                                        inputSchema: { type: "object", required: ["job_id","content"], properties: { job_id: { type: "string" }, content: { type: "string" } } } },
-  { name: "delete_job_note",                   annotations: DESTROY, description: "Delete a note from a job",                                   inputSchema: { type: "object", required: ["job_id","note_id"], properties: { job_id: { type: "string" }, note_id: { type: "string" } } } },
+  { name: "create_job_appointment",            annotations: WRITE,   description: "Add an appointment (a time slot with assigned techs) to a job. A job can have multiple appointments — use this for multi-visit work (install + recheck, diagnostic + repair). Required: job_id + scheduled_start + scheduled_end. CAVEAT: uses scheduled_start/scheduled_end/arrival_window_minutes (NOT _in_minutes like update_job_schedule). notify_customer=true sends booking SMS/email immediately. Worker internally remaps scheduled_start/end → HCP's start_time/end_time and assigned_employee_ids → dispatched_employees_ids. RESPONSE SHAPE ASYMMETRY: input uses scheduled_*/assigned_employee_ids, but the returned appointment object uses start_time/end_time/dispatched_employees_ids — read those keys when parsing the response.", inputSchema: { type: "object", required: ["job_id","scheduled_start","scheduled_end"], properties: { job_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z" }, arrival_window_minutes: { type: "number", description: "Arrival window in minutes (note: NOT _in_minutes), e.g. 30, 60, 120" }, assigned_employee_ids: { type: "array", items: { type: "string", description: "Employee ID, e.g. pro_abc123" } }, dispatcher_note: { type: "string" }, notify_customer: { type: "boolean", description: "Send booking SMS/email to customer immediately" } } } },
+  { name: "update_job_appointment",            annotations: WRITE,   description: "Update an existing appointment on a job — change scheduled time, assignees, or notify state. Required: job_id + appointment_id + assigned_employee_ids (HCP rejects updates without at least one assignee, even when not changing assignees — pass the current employees through). CAVEAT: NOT a true partial patch — omitting arrival_window_minutes RESETS it to 0, and omitting assigned_employee_ids triggers a 400. To preserve current values, read the appointment first (via list_job_appointments) and pass the current values back in. Same scheduled_start/scheduled_end naming as create_job_appointment. notify_customer=true sends update SMS/email immediately at edit time.", inputSchema: { type: "object", required: ["job_id","appointment_id","assigned_employee_ids"], properties: { job_id: { type: "string" }, appointment_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z. Omitting may reset on HCP side — pass current value to preserve." }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z. Omitting may reset on HCP side — pass current value to preserve." }, arrival_window_minutes: { type: "number", description: "Arrival window in minutes. CAVEAT: omitting resets to 0 — pass current value to preserve." }, assigned_employee_ids: { type: "array", description: "REQUIRED. Pass current employees if not changing them — omitting triggers HCP 400.", items: { type: "string" } }, notify_customer: { type: "boolean", description: "Send update SMS/email to customer immediately" } } } },
+  { name: "delete_job_appointment",            annotations: DESTROY, description: "Delete an appointment from a job (does NOT delete the parent job). Required: job_id + appointment_id. notify_customer=true sends cancellation SMS/email immediately. Use update_job_appointment instead if you're rescheduling.", inputSchema: { type: "object", required: ["job_id","appointment_id"], properties: { job_id: { type: "string" }, appointment_id: { type: "string" }, notify_customer: { type: "boolean", description: "Send cancellation SMS/email to customer immediately" } } } },
+  { name: "create_job_note",                   annotations: WRITE,   description: "Add a text note to a job's note history (internal — not visible to customer). Required: job_id + content. Returns the created note object with note_id. Notes are append-only (use delete_job_note to remove). CAVEAT: HCP fires NO webhook on note creation — downstream automation that depends on note events won't trigger.", inputSchema: { type: "object", required: ["job_id","content"], properties: { job_id: { type: "string" }, content: { type: "string", description: "Plain text note body (not customer-visible)" } } } },
+  { name: "delete_job_note",                   annotations: DESTROY, description: "Delete a single note from a job's note history. Required: job_id + note_id. Use this to remove a note that was created in error — there is no edit operation, so 'fixing' a note means delete + recreate.", inputSchema: { type: "object", required: ["job_id","note_id"], properties: { job_id: { type: "string" }, note_id: { type: "string" } } } },
   { name: "add_job_tag",                       annotations: WRITE,   description: "Add a tag to a job",                                         inputSchema: { type: "object", required: ["job_id","tag"], properties: { job_id: { type: "string" }, tag: { type: "string" } } } },
   { name: "delete_job_tag",                    annotations: DESTROY, description: "Remove a tag from a job",                                    inputSchema: { type: "object", required: ["job_id","tag_id"], properties: { job_id: { type: "string" }, tag_id: { type: "string" } } } },
   { name: "create_job_link",                   annotations: WRITE,   description: "Add a link to a job",                                        inputSchema: { type: "object", required: ["job_id","url"], properties: { job_id: { type: "string" }, url: { type: "string" }, name: { type: "string" } } } },
   { name: "create_job_attachment",             annotations: WRITE,   description: "Attach a file URL to a job",                                 inputSchema: { type: "object", required: ["job_id","url"], properties: { job_id: { type: "string" }, url: { type: "string" }, name: { type: "string" } } } },
-  { name: "create_job_line_item",              annotations: WRITE,   description: "Add a line item to a job",                                   inputSchema: { type: "object", required: ["job_id","name","unit_price"], properties: { job_id: { type: "string" }, name: { type: "string" }, unit_price: { type: "number", description: "Price in cents, e.g. 15000 = $150.00" }, quantity: { type: "number" }, unit_cost: { type: "number", description: "Cost in cents, e.g. 5000 = $50.00" }, taxable: { type: "boolean" } } } },
-  { name: "update_job_line_item",              annotations: WRITE,   description: "Update a single line item on a job",                         inputSchema: { type: "object", required: ["job_id","line_item_id"], properties: { job_id: { type: "string" }, line_item_id: { type: "string" }, name: { type: "string" }, unit_price: { type: "number", description: "Price in cents, e.g. 15000 = $150.00" }, quantity: { type: "number" } } } },
-  { name: "delete_job_line_item",              annotations: DESTROY, description: "Delete a line item from a job",                              inputSchema: { type: "object", required: ["job_id","line_item_id"], properties: { job_id: { type: "string" }, line_item_id: { type: "string" } } } },
-  { name: "bulk_update_job_line_items",        annotations: WRITE,   description: "Bulk update all line items on a job",                        inputSchema: { type: "object", required: ["job_id","line_items"], properties: { job_id: { type: "string" }, line_items: { type: "array", items: { type: "object" } } } } },
-  { name: "bulk_update_job_input_materials",   annotations: WRITE,   description: "Bulk update input materials for a job",                      inputSchema: { type: "object", required: ["job_id","materials"], properties: { job_id: { type: "string" }, materials: { type: "array", items: { type: "object" } } } } },
+  { name: "create_job_line_item",              annotations: WRITE,   description: "Add a single line item to an existing job's invoice. Required: job_id + name + unit_price (CENTS — 15000 = $150.00, NOT dollars). Use this for surgical additions; use bulk_update_job_line_items instead when replacing the entire line-item list. taxable defaults to true.", inputSchema: { type: "object", required: ["job_id","name","unit_price"], properties: { job_id: { type: "string" }, name: { type: "string" }, unit_price: { type: "number", description: "Price in CENTS, e.g. 15000 = $150.00 (NOT dollars)" }, quantity: { type: "number" }, unit_cost: { type: "number", description: "Cost in CENTS, e.g. 5000 = $50.00 (NOT dollars)" }, taxable: { type: "boolean", description: "Defaults to true" } } } },
+  { name: "update_job_line_item",              annotations: WRITE,   description: "Update fields on a single existing line item. Required: job_id + line_item_id. Partial patch — only fields you send are changed. unit_price in CENTS (15000 = $150.00, NOT dollars). For bulk replacement use bulk_update_job_line_items.", inputSchema: { type: "object", required: ["job_id","line_item_id"], properties: { job_id: { type: "string" }, line_item_id: { type: "string" }, name: { type: "string" }, unit_price: { type: "number", description: "Price in CENTS, e.g. 15000 = $150.00 (NOT dollars)" }, quantity: { type: "number" } } } },
+  { name: "delete_job_line_item",              annotations: DESTROY, description: "Delete a single line item from a job's invoice (other line items preserved). Required: job_id + line_item_id. Use bulk_update_job_line_items with the trimmed array if removing many at once — it's one API call instead of N.", inputSchema: { type: "object", required: ["job_id","line_item_id"], properties: { job_id: { type: "string" }, line_item_id: { type: "string" } } } },
+  { name: "bulk_update_job_line_items",        annotations: WRITE,   description: "REPLACE all line items on a job — sending a SUBSET deletes the omitted items (e.g. sending 1 item when 3 exist deletes 2). Required: job_id + line_items array. Each item: {name, unit_price (CENTS), quantity, unit_cost (CENTS), taxable}. CAVEAT: HCP refuses empty arrays (≥1 item required) — you cannot wipe to zero via this tool. To delete a single item use delete_job_line_item. To add WITHOUT wiping the rest, read current items via list_job_line_items first, append yours, then send the full combined array. Use create_job_line_item to add a single item without touching the rest.", inputSchema: { type: "object", required: ["job_id","line_items"], properties: { job_id: { type: "string" }, line_items: { type: "array", description: "Full replacement array (≥1 item, [] is rejected). Each item: {name, unit_price (cents), quantity, unit_cost (cents), taxable}", items: { type: "object" } } } } },
+  { name: "bulk_update_job_input_materials",   annotations: WRITE,   description: "REPLACE all input materials on a job — sending a SUBSET deletes the omitted items. Required: job_id + materials array. Each item: {pricebook_material_uuid, quantity, unit_cost (CENTS)}. Input materials drive cost-of-job tracking and are separate from invoice line items. CAVEAT: HCP likely refuses empty arrays here too (same pattern as bulk_update_job_line_items — sending [] is not the way to wipe). To add WITHOUT wiping the rest, read via list_job_input_materials first, append, then send the full combined array.", inputSchema: { type: "object", required: ["job_id","materials"], properties: { job_id: { type: "string" }, materials: { type: "array", description: "Full replacement array (sending [] likely rejected). Each item: {pricebook_material_uuid, quantity, unit_cost (cents)}", items: { type: "object" } } } } },
 
   // ── Estimates ─────────────────────────────────────────────────────────────
-  { name: "create_estimate",                   annotations: WRITE,   description: "Create a new estimate",                                      inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string" }, address_id: { type: "string" }, notes: { type: "string" }, lead_source: { type: "string" }, assigned_employee_ids: { type: "array", items: { type: "string" } } } } },
-  { name: "approve_estimate_options",          annotations: WRITE,   description: "Approve estimate options",                                   inputSchema: { type: "object", required: ["option_ids"], properties: { option_ids: { type: "array", items: { type: "string" } } } } },
-  { name: "decline_estimate_options",          annotations: WRITE,   description: "Decline estimate options",                                   inputSchema: { type: "object", required: ["option_ids"], properties: { option_ids: { type: "array", items: { type: "string" } } } } },
-  { name: "create_estimate_option",            annotations: WRITE,   description: "Create an option on an estimate",                            inputSchema: { type: "object", required: ["estimate_id"], properties: { estimate_id: { type: "string" }, name: { type: "string" } } } },
-  { name: "create_estimate_option_note",       annotations: WRITE,   description: "Add a note to an estimate option",                           inputSchema: { type: "object", required: ["estimate_id","option_id","content"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, content: { type: "string" } } } },
-  { name: "delete_estimate_option_note",       annotations: DESTROY, description: "Delete a note from an estimate option",                      inputSchema: { type: "object", required: ["estimate_id","option_id","note_id"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, note_id: { type: "string" } } } },
-  { name: "bulk_update_estimate_option_line_items", annotations: WRITE, description: "Bulk update line items on an estimate option",            inputSchema: { type: "object", required: ["estimate_id","option_id","line_items"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, line_items: { type: "array", items: { type: "object" } } } } },
-  { name: "create_estimate_option_attachment", annotations: WRITE,   description: "Add an attachment to an estimate option",                    inputSchema: { type: "object", required: ["estimate_id","option_id","url"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, url: { type: "string" } } } },
-  { name: "create_estimate_option_link",       annotations: WRITE,   description: "Add a link to an estimate option",                           inputSchema: { type: "object", required: ["estimate_id","option_id","url"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, url: { type: "string" } } } },
-  { name: "update_estimate_option_schedule",   annotations: WRITE,   description: "Update the schedule for an estimate option",                 inputSchema: { type: "object", required: ["estimate_id","option_id"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z" } } } },
+  { name: "create_estimate",                   annotations: WRITE,   description: "Create an estimate for a customer. Required: customer_id. HCP refuses estimates without at least one option — the worker auto-injects options: [{name: 'Option 1'}] if you omit the options param, so the call always succeeds with just customer_id. To customize option naming or create multiple options inline, pass options:[{name:'...'}, ...]. After creation, call bulk_update_estimate_option_line_items to populate line items on each option (you'll need the option_id from the returned estimate.options array). Or call create_estimate_option to add more options later.", inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string" }, address_id: { type: "string", description: "Address ID — must belong to this customer (get from get_customer)" }, notes: { type: "string" }, lead_source: { type: "string" }, assigned_employee_ids: { type: "array", items: { type: "string" } }, options: { type: "array", description: "Optional. Each item: {name: string}. If omitted or empty, worker auto-injects [{name: 'Option 1'}].", items: { type: "object", properties: { name: { type: "string", description: "Display name for this option (e.g. 'Standard Install', 'Premium with 10-Year Warranty')" } } } } } } },
+  { name: "approve_estimate_options",          annotations: WRITE,   description: "Approve one or more estimate options on behalf of the customer (accepting the quote). Required: option_ids array — pass OPTION IDs from create_estimate_option or get_estimate.options[].id, NOT the estimate_id. Sets option(s) to approved; HCP marks parent estimate accordingly. Use convert_lead instead if approving means turning into a job.", inputSchema: { type: "object", required: ["option_ids"], properties: { option_ids: { type: "array", description: "Array of OPTION IDs (NOT estimate_id)", items: { type: "string" } } } } },
+  { name: "decline_estimate_options",          annotations: WRITE,   description: "Decline one or more estimate options (customer rejecting a quote). Required: option_ids array (OPTION IDs, NOT estimate_id). Marks option(s) as declined and updates parent estimate. Different from delete — declined options stay on the estimate for the audit trail.", inputSchema: { type: "object", required: ["option_ids"], properties: { option_ids: { type: "array", description: "Array of OPTION IDs (NOT estimate_id)", items: { type: "string" } } } } },
+  { name: "create_estimate_option",            annotations: WRITE,   description: "Create an option (a priced variant) on an existing estimate. Required: estimate_id. STEP 2 of the 3-step estimate chain. An estimate can have multiple options — customer picks one to approve. After this returns option_id, call bulk_update_estimate_option_line_items to populate the option's pricing.", inputSchema: { type: "object", required: ["estimate_id"], properties: { estimate_id: { type: "string" }, name: { type: "string", description: "Option label shown to customer, e.g. 'Standard Install', 'Premium Install with 10-Year Warranty'" } } } },
+  { name: "create_estimate_option_note",       annotations: WRITE,   description: "Add a text note to a specific estimate option (notes are per-OPTION, not per-estimate). Required: estimate_id + option_id + content. Returns the note object with note_id (use that with delete_estimate_option_note).", inputSchema: { type: "object", required: ["estimate_id","option_id","content"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, content: { type: "string" } } } },
+  { name: "delete_estimate_option_note",       annotations: DESTROY, description: "Delete a single note from an estimate option. Required: estimate_id + option_id + note_id. Use this to clean up a note added in error — there is no edit operation.", inputSchema: { type: "object", required: ["estimate_id","option_id","note_id"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, note_id: { type: "string" } } } },
+  { name: "bulk_update_estimate_option_line_items", annotations: WRITE, description: "REPLACE all line items on an estimate option — sending a SUBSET deletes the omitted items. STEP 3 of the 3-step estimate chain. Required: estimate_id + option_id + line_items array. Each item: {name, unit_price (CENTS), quantity, unit_cost (CENTS), taxable}. CAVEAT: HCP refuses empty arrays (≥1 item required) — cannot wipe to zero via this tool. To add WITHOUT wiping the rest, read current items via list_estimate_option_line_items first, append, then send full combined array.",            inputSchema: { type: "object", required: ["estimate_id","option_id","line_items"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, line_items: { type: "array", description: "Full replacement array (≥1 item, [] is rejected). Each item: {name, unit_price (cents), quantity, unit_cost (cents), taxable}", items: { type: "object" } } } } },
+  { name: "create_estimate_option_attachment", annotations: WRITE,   description: "Attach a file URL to an estimate option (PDFs, specs, photos). Required: estimate_id + option_id + url. Attachment appears on the customer-facing proposal.", inputSchema: { type: "object", required: ["estimate_id","option_id","url"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, url: { type: "string", description: "Publicly accessible URL to the file" } } } },
+  { name: "create_estimate_option_link",       annotations: WRITE,   description: "Add a hyperlink to an estimate option (videos, product pages, scheduling). Required: estimate_id + option_id + url. Link appears on the customer-facing proposal.", inputSchema: { type: "object", required: ["estimate_id","option_id","url"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, url: { type: "string" } } } },
+  { name: "update_estimate_option_schedule",   annotations: WRITE,   description: "Set or update when work for an estimate option is proposed to happen (e.g. install date offered to customer). Required: estimate_id + option_id. Uses scheduled_start/scheduled_end (ISO 8601) — same naming as create_job_appointment, DIFFERENT from update_job_schedule (start_time/end_time). Informational — create_job uses its own schedule when the option is approved and converted.",                 inputSchema: { type: "object", required: ["estimate_id","option_id"], properties: { estimate_id: { type: "string" }, option_id: { type: "string" }, scheduled_start: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T09:00:00Z" }, scheduled_end: { type: "string", description: "ISO 8601 datetime, e.g. 2025-01-15T11:00:00Z" } } } },
 
   // ── Leads ─────────────────────────────────────────────────────────────────
-  { name: "create_lead",                       annotations: WRITE,   description: "Create a new lead",                                          inputSchema: { type: "object", properties: { customer_id: { type: "string" }, first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, description: { type: "string" }, notes: { type: "string" }, lead_source: { type: "string" } } } },
-  { name: "convert_lead",                      annotations: WRITE,   description: "Convert a lead to an estimate or job",                       inputSchema: { type: "object", required: ["lead_id","convert_to"], properties: { lead_id: { type: "string" }, convert_to: { type: "string", enum: ["estimate","job"] } } } },
+  { name: "create_lead",                       annotations: WRITE,   description: "Create a new lead in the sales pipeline. Required: customer_id (HCP refuses leads without a customer link — use create_customer FIRST if the lead isn't an existing customer yet). first_name/last_name/email are stored on the lead but do NOT substitute for customer_id. lead_source must match an existing source from list_lead_sources (or create one via create_lead_source first). After creation, use convert_lead to promote to an estimate or job.",                                          inputSchema: { type: "object", required: ["customer_id"], properties: { customer_id: { type: "string", description: "REQUIRED — link to an existing customer (cus_*). Use create_customer first if needed." }, first_name: { type: "string" }, last_name: { type: "string" }, email: { type: "string" }, mobile_number: { type: "string" }, description: { type: "string" }, notes: { type: "string" }, lead_source: { type: "string", description: "Source name — must match an existing lead source from list_lead_sources" } } } },
+  { name: "convert_lead",                      annotations: WRITE,   description: "Convert a lead into either an estimate or a job. Required: lead_id + convert_to ('estimate' or 'job'). Returns the new resource. Lead remains in HCP but is marked converted. Use 'estimate' for quote-needed flow; 'job' for direct-book flow (no quote needed).",                       inputSchema: { type: "object", required: ["lead_id","convert_to"], properties: { lead_id: { type: "string" }, convert_to: { type: "string", enum: ["estimate","job"], description: "'estimate' for quote flow, 'job' for direct-book flow" } } } },
 
   // ── Lead Sources ──────────────────────────────────────────────────────────
-  { name: "create_lead_source",                annotations: WRITE,   description: "Create a new lead source",                                   inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
-  { name: "update_lead_source",                annotations: WRITE,   description: "Update a lead source",                                       inputSchema: { type: "object", required: ["lead_source_id","name"], properties: { lead_source_id: { type: "string" }, name: { type: "string" } } } },
+  { name: "create_lead_source",                annotations: WRITE,   description: "Create a new lead source attribution option (e.g. 'Google Ads — Carrier Brand', 'Referral — Existing Customer'). Required: name. After creation the source is available in lead_source dropdowns on create_lead, create_estimate, create_customer.",                                   inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
+  { name: "update_lead_source",                annotations: WRITE,   description: "Rename an existing lead source. Required: lead_source_id + name. Historical leads/estimates retain their attribution to this source under the new name.",                                       inputSchema: { type: "object", required: ["lead_source_id","name"], properties: { lead_source_id: { type: "string" }, name: { type: "string" } } } },
 
   // ── Tags ──────────────────────────────────────────────────────────────────
-  { name: "create_tag",                        annotations: WRITE,   description: "Create a new tag",                                           inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
-  { name: "update_tag",                        annotations: WRITE,   description: "Update an existing tag",                                     inputSchema: { type: "object", required: ["tag_id","name"], properties: { tag_id: { type: "string" }, name: { type: "string" } } } },
+  { name: "create_tag",                        annotations: WRITE,   description: "Create a new job tag in the company tag library. Required: name. After creation the tag is available to apply via add_job_tag (which takes the tag string, not the tag_id).",                                           inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
+  { name: "update_tag",                        annotations: WRITE,   description: "Rename an existing job tag. Required: tag_id + name. All jobs already tagged with this tag inherit the new name automatically.",                                     inputSchema: { type: "object", required: ["tag_id","name"], properties: { tag_id: { type: "string" }, name: { type: "string" } } } },
 
   // ── Job Types ─────────────────────────────────────────────────────────────
-  { name: "create_job_type",                   annotations: WRITE,   description: "Create a new job type",                                      inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
-  { name: "update_job_type",                   annotations: WRITE,   description: "Update a job type",                                          inputSchema: { type: "object", required: ["job_type_id","name"], properties: { job_type_id: { type: "string" }, name: { type: "string" } } } },
+  { name: "create_job_type",                   annotations: WRITE,   description: "Create a new job type classification (e.g. 'AC Install', 'Maintenance', 'Service Call', 'Warranty'). Required: name. Used for job categorization, reporting buckets, and default pricing templates.",                                      inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
+  { name: "update_job_type",                   annotations: WRITE,   description: "Rename an existing job type. Required: job_type_id + name. Historical jobs keep their classification under the new name.",                                          inputSchema: { type: "object", required: ["job_type_id","name"], properties: { job_type_id: { type: "string" }, name: { type: "string" } } } },
 
   // ── Pricebook ─────────────────────────────────────────────────────────────
-  { name: "create_pricebook_material",         annotations: WRITE,   description: "Create a pricebook material",                                inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, description: { type: "string" }, unit_cost: { type: "number", description: "Cost in cents, e.g. 5000 = $50.00" }, material_category_uuid: { type: "string" } } } },
-  { name: "update_pricebook_material",         annotations: WRITE,   description: "Update a pricebook material",                                inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" }, name: { type: "string" }, unit_cost: { type: "number", description: "Cost in cents, e.g. 5000 = $50.00" } } } },
+  { name: "create_pricebook_material",         annotations: WRITE,   description: "Create a new pricebook material entry (parts you stock and resell on jobs). Required: name. unit_cost in CENTS (5000 = $50.00, NOT dollars). Optionally assign to a material_category_uuid from list_material_categories. NOTE: pricebook SERVICES are read-only via this worker — manage those in the HCP dashboard.",                                inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" }, description: { type: "string" }, unit_cost: { type: "number", description: "Cost in CENTS, e.g. 5000 = $50.00 (NOT dollars)" }, material_category_uuid: { type: "string", description: "Optional — from list_material_categories" } } } },
+  { name: "update_pricebook_material",         annotations: WRITE,   description: "Update fields on an existing pricebook material. Required: uuid. Partial patch — only fields you send are changed. unit_cost in CENTS (5000 = $50.00, NOT dollars).",                                inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" }, name: { type: "string" }, unit_cost: { type: "number", description: "Cost in CENTS, e.g. 5000 = $50.00 (NOT dollars)" } } } },
   { name: "delete_pricebook_material",         annotations: DESTROY, description: "Delete a pricebook material",                                inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
-  { name: "create_material_category",          annotations: WRITE,   description: "Create a material category",                                 inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
-  { name: "update_material_category",          annotations: WRITE,   description: "Update a material category",                                 inputSchema: { type: "object", required: ["uuid","name"], properties: { uuid: { type: "string" }, name: { type: "string" } } } },
+  { name: "create_material_category",          annotations: WRITE,   description: "Create a new material category (groups pricebook materials for browsing/filtering). Required: name. Use the returned uuid in create_pricebook_material's material_category_uuid to assign materials to this category.",                                 inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
+  { name: "update_material_category",          annotations: WRITE,   description: "Rename an existing material category. Required: uuid + name. Materials assigned to this category keep their assignment under the new name.",                                 inputSchema: { type: "object", required: ["uuid","name"], properties: { uuid: { type: "string" }, name: { type: "string" } } } },
   { name: "delete_material_category",          annotations: DESTROY, description: "Delete a material category",                                 inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
-  { name: "create_price_form",                 annotations: WRITE,   description: "Create a price form",                                        inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
-  { name: "update_price_form",                 annotations: WRITE,   description: "Update a price form",                                        inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" }, name: { type: "string" } } } },
+  { name: "create_price_form",                 annotations: WRITE,   description: "Create a new price form (proposal/quote PDF template). Required: name. Used to generate branded customer-facing pricing documents from estimates. Configure form contents in the HCP dashboard after creation.",                                        inputSchema: { type: "object", required: ["name"], properties: { name: { type: "string" } } } },
+  { name: "update_price_form",                 annotations: WRITE,   description: "Update an existing price form (rename or modify). Required: uuid. Partial patch — only fields you send are changed.",                                        inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" }, name: { type: "string" } } } },
   { name: "delete_price_form",                 annotations: DESTROY, description: "Delete a price form",                                        inputSchema: { type: "object", required: ["uuid"], properties: { uuid: { type: "string" } } } },
 
   // ── Schedule ──────────────────────────────────────────────────────────────
-  { name: "update_schedule_availability",      annotations: WRITE,   description: "Update company schedule windows",                            inputSchema: { type: "object", required: ["schedule"], properties: { schedule: { type: "object" } } } },
+  { name: "update_schedule_availability",      annotations: WRITE,   description: "Update company-wide schedule availability windows. Entire schedule object is replaced. Body mirrors the get_schedule_availability response shape. Times are HH:MM 24-hour. days_of_week omitted = closed that day.",
+    inputSchema: {
+      type: "object",
+      required: ["schedule"],
+      properties: {
+        schedule: {
+          type: "object",
+          required: ["daily_availabilities"],
+          description: "Full schedule object — replaces existing entirely. Mirror get_schedule_availability response shape.",
+          properties: {
+            availability_buffer_in_days: { type: "number", description: "Days of lead time required before booking. 0 = same-day OK." },
+            daily_availabilities: {
+              type: "object",
+              description: "HCP list wrapper. Inner data array holds one entry per day_name you want windows for.",
+              properties: {
+                object: { type: "string", enum: ["list"] },
+                data: {
+                  type: "array",
+                  items: {
+                    type: "object",
+                    required: ["day_name", "schedule_windows"],
+                    properties: {
+                      day_name: { type: "string", enum: ["monday","tuesday","wednesday","thursday","friday","saturday","sunday"], description: "Day of week (lowercase)." },
+                      schedule_windows: {
+                        type: "object",
+                        description: "HCP list wrapper for time windows on this day.",
+                        properties: {
+                          object: { type: "string", enum: ["list"] },
+                          data: {
+                            type: "array",
+                            description: "Array of start/end time windows for this day. e.g. [{start_time: '08:00', end_time: '10:00'}, ...]",
+                            items: {
+                              type: "object",
+                              required: ["start_time", "end_time"],
+                              properties: {
+                                start_time: { type: "string", description: "HH:MM 24-hour, e.g. '08:00'" },
+                                end_time: { type: "string", description: "HH:MM 24-hour, e.g. '17:00'" },
+                              }
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
 
   // ── Pipeline ──────────────────────────────────────────────────────────────
-  { name: "update_pipeline_status",            annotations: WRITE,   description: "Update a pipeline status",                                   inputSchema: { type: "object", required: ["status"], properties: { status: { type: "object" } } } },
+  { name: "update_pipeline_status",            annotations: WRITE,   description: "Update a pipeline status record (rename it). Pass the full status object with id from list_pipeline_statuses. status_type controls bucket behavior (e.g. job_scheduled drives dispatch UI).",
+    inputSchema: {
+      type: "object",
+      required: ["status"],
+      properties: {
+        status: {
+          type: "object",
+          required: ["id"],
+          description: "Pipeline status object. id required; name is the most common updatable field.",
+          properties: {
+            id: { type: "string", description: "Pipeline status ID (kcs_*) from list_pipeline_statuses." },
+            name: { type: "string", description: "Display name for the status (e.g. 'Needs Review', 'First Attempt')." },
+            status_type: {
+              type: "string",
+              enum: [
+                "job_unscheduled","job_scheduled","job_in_progress","job_completed","job_custom_status","job_plain",
+                "lead_unscheduled","lead_scheduled","lead_in_progress","lead_completed","lead_custom_status","lead_plain",
+                "estimate_unscheduled","estimate_scheduled","estimate_in_progress","estimate_completed","estimate_custom_status","estimate_plain"
+              ],
+              description: "Resource_type_behavior. job_scheduled triggers dispatch UI; *_custom_status is a user-defined bucket; *_completed marks the resource done. Lead/estimate variants follow same pattern."
+            }
+          }
+        }
+      }
+    }
+  },
 
   // ── Application ───────────────────────────────────────────────────────────
-  { name: "enable_application",                annotations: WRITE,   description: "Enable the application integration",                         inputSchema: { type: "object", properties: {} } },
-  { name: "disable_application",               annotations: DESTROY, description: "Disable the application integration",                        inputSchema: { type: "object", properties: {} } },
+  { name: "enable_application",                annotations: WRITE,   description: "Enable this API application's integration with the HCP company account. No parameters.",                         inputSchema: { type: "object", properties: {} } },
+  { name: "disable_application",               annotations: DESTROY, description: "Disable this API application's integration with the HCP company account. Destructive — disables all access.",                        inputSchema: { type: "object", properties: {} } },
 
   // ── Webhooks ──────────────────────────────────────────────────────────────
   { name: "create_webhook",                    annotations: WRITE,   description: "Enable webhook subscription for this company. Configure URL and events in HCP UI first.", inputSchema: { type: "object", properties: {} } },
@@ -342,6 +501,65 @@ const TOOLS = [
 
 // Prefix all tool descriptions with system name for cross-connector clarity
 for (const t of TOOLS) t.description = "[HouseCall Pro] " + t.description;
+
+// ─── Per-tool transforms (v3.4.1 Option B rollback) ─────────────────────────
+// Section 2 originally introduced per-tool field whitelists ("projectors") that
+// aggressively stripped fields from list_jobs / get_job responses. That over-stripped
+// semantically meaningful fields (customer.email, employee.role, customer.kind, etc.)
+// that Claude needs for ad-hoc reasoning even when no current consumer reads them.
+//
+// v3.4.1 rolls projection back to universal Tier-A stripping only (see stripFields
+// above). PROJECTORS dict is intentionally empty — re-add entries here only if a
+// specific tool has additional always-safe fields beyond STRIP_FIELDS.
+//
+// LIST_KEY is preserved and EXPANDED — the _pagination plaintext hint (Section 2 win)
+// runs independently of per-tool projection and benefits every list tool we register here.
+// Add new list tools' array-key here as they're rolled out.
+
+const PROJECTORS = {};
+
+const LIST_KEY = {
+  list_jobs:               "jobs",
+  list_customers:          "customers",
+  list_invoices:           "invoices",
+  list_estimates:          "estimates",
+  list_leads:              "leads",
+  list_employees:          "employees",
+  list_events:             "events",
+  list_tags:               "tags",
+  list_pricebook_services: "items",   // normalizePricebookPage rewrites the response shape
+  list_pricebook_materials:"items",   // normalizePricebookPage rewrites the response shape
+};
+
+function project(toolName, args, data, env) {
+  // Kill switch — flip env var in CF dashboard to disable project() transforms
+  // (pagination hint, per-tool projector if any). Note: stripFields is independent
+  // and continues running unless raw=true is also passed.
+  if (env?.PROJECT_ENABLED === "false") return data;
+  // Per-call opt-out of project() transforms
+  if (args?.raw === true) return data;
+
+  const listKey = LIST_KEY[toolName];
+  const fn = PROJECTORS[toolName];
+
+  // List tool: optionally apply projector, then add _pagination hint
+  if (listKey && data && Array.isArray(data[listKey])) {
+    let result = fn ? { ...data, [listKey]: data[listKey].map(fn) } : data;
+    if (!args?.fetch_all && data.total_items != null && data.total_pages != null) {
+      const showing = data[listKey].length;
+      const nextPage = (data.page || 1) + 1;
+      result = {
+        ...result,
+        _pagination: `Showing ${showing} of ${data.total_items} total. Page ${data.page} of ${data.total_pages}. Pass page=${nextPage} for next page, or use fetch_all=true for all records.`,
+      };
+    }
+    return result;
+  }
+
+  // Single-record shape with a registered projector
+  if (fn) return fn(data);
+  return data;
+}
 
 async function callTool(name, args, apiKey) {
   const c = (method, path, body) => hcp(apiKey, method, path, body);
@@ -362,18 +580,18 @@ async function callTool(name, args, apiKey) {
   }
 
   switch (name) {
-    case "list_customers": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/customers", rest, "customers"); return c("GET", `/customers${qs(rest)}`); }
-    case "get_customer": { const { customer_id, ...q } = args; return c("GET", `/customers/${customer_id}${qs(q)}`); }
+    case "list_customers": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/customers", rest, "customers"); return c("GET", `/customers${qs(rest)}`); }
+    case "get_customer": { const { customer_id, raw, ...q } = args; return c("GET", `/customers/${customer_id}${qs(q)}`); }
     case "create_customer": return c("POST", `/customers`, args);
     case "update_customer": { const { customer_id, ...b } = args; return c("PUT", `/customers/${customer_id}`, b); }
     case "list_customer_addresses": { const { customer_id, ...q } = args; return c("GET", `/customers/${customer_id}/addresses${qs(q)}`); }
     case "get_customer_address": return c("GET", `/customers/${args.customer_id}/addresses/${args.address_id}`);
     case "create_customer_address": { const { customer_id, ...b } = args; return c("POST", `/customers/${customer_id}/addresses`, b); }
-    case "list_employees": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/employees", rest, "employees"); return c("GET", `/employees${qs(rest)}`); }
-    case "list_jobs": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/jobs", rest, "jobs"); return c("GET", `/jobs${qs(rest)}`); }
-    case "get_job": { const { job_id, ...q } = args; return c("GET", `/jobs/${job_id}${qs(q)}`); }
+    case "list_employees": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/employees", rest, "employees"); return c("GET", `/employees${qs(rest)}`); }
+    case "list_jobs": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/jobs", rest, "jobs"); return c("GET", `/jobs${qs(rest)}`); }
+    case "get_job": { const { job_id, raw, ...q } = args; return c("GET", `/jobs/${job_id}${qs(q)}`); }
     case "create_job": return c("POST", `/jobs`, args);
-    case "dispatch_job": { const { job_id, ...b } = args; return c("PUT", `/jobs/${job_id}/dispatch`, b); }
+    case "dispatch_job": { const { job_id, employee_ids, ...b } = args; return c("PUT", `/jobs/${job_id}/dispatch`, { dispatched_employees: (employee_ids || []).map(id => ({ employee_id: id })), ...b }); }
     case "lock_job": return c("POST", `/jobs/${args.job_id}/lock`);
     case "lock_jobs": return c("POST", `/jobs/lock`, args);
     case "update_job_schedule": { const { job_id, ...b } = args; return c("PUT", `/jobs/${job_id}/schedule`, b); }
@@ -396,9 +614,9 @@ async function callTool(name, args, apiKey) {
     case "list_job_input_materials": return c("GET", `/jobs/${args.job_id}/job_input_materials`);
     case "bulk_update_job_input_materials": { const { job_id, ...b } = args; return c("PUT", `/jobs/${job_id}/job_input_materials/bulk_update`, b); }
     case "list_job_invoices": return c("GET", `/jobs/${args.job_id}/invoices`);
-    case "list_estimates": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/estimates", rest, "estimates"); return c("GET", `/estimates${qs(rest)}`); }
-    case "get_estimate": { const { estimate_id, ...q } = args; return c("GET", `/estimates/${estimate_id}${qs(q)}`); }
-    case "create_estimate": return c("POST", `/estimates`, args);
+    case "list_estimates": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/estimates", rest, "estimates"); return c("GET", `/estimates${qs(rest)}`); }
+    case "get_estimate": { const { estimate_id, raw, ...q } = args; return c("GET", `/estimates/${estimate_id}${qs(q)}`); }
+    case "create_estimate": { const body = { ...args }; if (!Array.isArray(body.options) || body.options.length === 0) body.options = [{ name: "Option 1" }]; return c("POST", `/estimates`, body); }
     case "approve_estimate_options": return c("POST", `/estimates/options/approve`, args);
     case "decline_estimate_options": return c("POST", `/estimates/options/decline`, args);
     case "create_estimate_option": { const { estimate_id, ...b } = args; return c("POST", `/estimates/${estimate_id}/options`, b); }
@@ -409,29 +627,29 @@ async function callTool(name, args, apiKey) {
     case "create_estimate_option_attachment": { const { estimate_id, option_id, ...b } = args; return c("POST", `/estimates/${estimate_id}/options/${option_id}/attachments`, b); }
     case "create_estimate_option_link": { const { estimate_id, option_id, ...b } = args; return c("POST", `/estimates/${estimate_id}/options/${option_id}/links`, b); }
     case "update_estimate_option_schedule": { const { estimate_id, option_id, ...b } = args; return c("PUT", `/estimates/${estimate_id}/options/${option_id}/schedule`, b); }
-    case "list_invoices": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/invoices", rest, "invoices"); return c("GET", `/invoices${qs(rest)}`); }
+    case "list_invoices": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/invoices", rest, "invoices"); return c("GET", `/invoices${qs(rest)}`); }
     case "get_invoice_by_uuid": return c("GET", `/api/invoices/${args.uuid}`);
     case "preview_invoice": throw new Error("preview_invoice returns a raw HTML blob — use get_invoice_by_uuid for structured invoice data instead.");
-    case "list_leads": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/leads", rest, "leads"); return c("GET", `/leads${qs(rest)}`); }
+    case "list_leads": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/leads", rest, "leads"); return c("GET", `/leads${qs(rest)}`); }
     case "get_lead": return c("GET", `/leads/${args.lead_id}`);
     case "create_lead": return c("POST", `/leads`, args);
-    case "convert_lead": { const { lead_id, ...b } = args; return c("PUT", `/leads/${lead_id}/convert`, b); }
+    case "convert_lead": { const { lead_id, convert_to, ...b } = args; return c("POST", `/leads/${lead_id}/convert`, { type: convert_to, ...b }); }
     case "list_lead_line_items": return c("GET", `/leads/${args.lead_id}/line_items`);
-    case "list_lead_sources": return c("GET", `/lead_sources${qs(args)}`);
+    case "list_lead_sources": { const { raw, ...rest } = args; return c("GET", `/lead_sources${qs(rest)}`); }
     case "create_lead_source": return c("POST", `/lead_sources`, args);
     case "update_lead_source": { const { lead_source_id, ...b } = args; return c("PUT", `/lead_sources/${lead_source_id}`, b); }
-    case "list_tags": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/tags", rest, "tags"); return c("GET", `/tags${qs(rest)}`); }
+    case "list_tags": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/tags", rest, "tags"); return c("GET", `/tags${qs(rest)}`); }
     case "create_tag": return c("POST", `/tags`, args);
     case "update_tag": { const { tag_id, ...b } = args; return c("PUT", `/tags/${tag_id}`, b); }
-    case "list_job_types": return c("GET", `/job_fields/job_types${qs(args)}`);
+    case "list_job_types": { const { raw, ...rest } = args; return c("GET", `/job_fields/job_types${qs(rest)}`); }
     case "create_job_type": return c("POST", `/job_fields/job_types`, args);
     case "update_job_type": { const { job_type_id, ...b } = args; return c("PUT", `/job_fields/job_types/${job_type_id}`, b); }
-    case "list_pricebook_services": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/api/price_book/services", rest, "services"); return c("GET", `/api/price_book/services${qs(rest)}`); }
-    case "list_pricebook_materials": { const { fetch_all, ...rest } = args; if (fetch_all) return fetchAll("/api/price_book/materials", rest, "materials"); return c("GET", `/api/price_book/materials${qs(rest)}`); }
+    case "list_pricebook_services": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/api/price_book/services", rest, "services"); return c("GET", `/api/price_book/services${qs(rest)}`); }
+    case "list_pricebook_materials": { const { fetch_all, raw, ...rest } = args; if (fetch_all) return fetchAll("/api/price_book/materials", rest, "materials"); return c("GET", `/api/price_book/materials${qs(rest)}`); }
     case "create_pricebook_material": { const { material_category_uuid, ...b } = args; return c("POST", `/api/price_book/materials${qs({ material_category_uuid })}`, b); }
     case "update_pricebook_material": { const { uuid, ...b } = args; return c("PUT", `/api/price_book/materials/${uuid}`, b); }
     case "delete_pricebook_material": return c("DELETE", `/api/price_book/materials/${args.uuid}`);
-    case "list_material_categories": return c("GET", `/api/price_book/material_categories${qs(args)}`);
+    case "list_material_categories": { const { raw, ...rest } = args; return c("GET", `/api/price_book/material_categories${qs(rest)}`); }
     case "create_material_category": return c("POST", `/api/price_book/material_categories`, args);
     case "update_material_category": { const { uuid, ...b } = args; return c("PUT", `/api/price_book/material_categories/${uuid}`, b); }
     case "delete_material_category": { const { uuid, ...b } = args; return c("DELETE", `/api/price_book/material_categories/${uuid}`, b); }
@@ -441,7 +659,7 @@ async function callTool(name, args, apiKey) {
     case "update_price_form": { const { uuid, ...b } = args; return c("PUT", `/api/price_book/price_forms/${uuid}`, b); }
     case "delete_price_form": return c("DELETE", `/api/price_book/price_forms/${args.uuid}`);
     case "list_events": {
-      const { fetch_all, start_time_min, start_time_max, ...rest } = args;
+      const { fetch_all, raw, start_time_min, start_time_max, ...rest } = args;
       let data = fetch_all ? await fetchAll("/events", rest, "events") : await c("GET", `/events${qs(rest)}`);
       if (start_time_min || start_time_max) {
         const min = start_time_min ? new Date(start_time_min) : null;
@@ -462,10 +680,10 @@ async function callTool(name, args, apiKey) {
     case "get_booking_windows": return c("GET", `/company/schedule_availability/booking_windows${qs(args)}`);
     case "list_routes": return c("GET", `/routes${qs(args)}`);
     case "list_service_zones": return c("GET", `/service_zones${qs(args)}`);
-    case "list_pipeline_statuses": return c("GET", `/pipeline/statuses${qs(args)}`);
+    case "list_pipeline_statuses": { const { raw, ...rest } = args; return c("GET", `/pipeline/statuses${qs(rest)}`); }
     case "update_pipeline_status": return c("PUT", `/pipeline/statuses`, args.status);
     case "get_company": return c("GET", `/company`);
-    case "list_checklists": return c("GET", `/checklists${qs(args)}`);
+    case "list_checklists": { const { raw, ...rest } = args; return c("GET", `/checklists${qs(rest)}`); }
     case "enable_application": return c("POST", `/application/enable`);
     case "disable_application": return c("POST", `/application/disable`);
     case "create_webhook": return c("POST", `/webhooks/subscription`, {});
@@ -515,7 +733,7 @@ async function handleMCP(request, env) {
   const readOnly = tier !== "write";
 
   if (request.method === "GET") {
-    return new Response(JSON.stringify({ name: "HouseCall Pro", version: "3.3.3", protocolVersion: "2025-03-26", description: "HouseCall Pro field service management — customers, jobs, estimates, invoices, pricebook, and dispatch.", icons: [{ src: HCP_ICON, mimeType: HCP_ICON_MIME, sizes: ["any"] }] }), { headers: { "Content-Type": "application/json", ...CORS } });
+    return new Response(JSON.stringify({ name: "HouseCall Pro", version: "3.4.5", protocolVersion: "2025-03-26", description: "HouseCall Pro field service management — customers, jobs, estimates, invoices, pricebook, and dispatch.", icons: [{ src: HCP_ICON, mimeType: HCP_ICON_MIME, sizes: ["any"] }] }), { headers: { "Content-Type": "application/json", ...CORS } });
   }
   let msg;
   try { msg = await request.json(); } catch { return mcpErr(null, -32700, "Parse error"); }
@@ -523,7 +741,7 @@ async function handleMCP(request, env) {
   try {
     switch (method) {
       case "initialize":
-        return mcpJson(id, { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "HouseCall Pro", version: "3.3.3", description: "HouseCall Pro field service management — customers, jobs, estimates, invoices, pricebook, and dispatch.", icons: [{ src: HCP_ICON, mimeType: HCP_ICON_MIME, sizes: ["any"] }] } });
+        return mcpJson(id, { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "HouseCall Pro", version: "3.4.5", description: "HouseCall Pro field service management — customers, jobs, estimates, invoices, pricebook, and dispatch.", icons: [{ src: HCP_ICON, mimeType: HCP_ICON_MIME, sizes: ["any"] }] } });
       case "notifications/initialized":
         return new Response(null, { status: 204, headers: CORS });
       case "ping":
@@ -541,8 +759,16 @@ async function handleMCP(request, env) {
         let result;
         try {
           result = await callTool(name, args || {}, env.HCP_API_KEY);
-          result = stripPermissions(result);
-          result = normalizePricebookPage(result);
+          // Universal Tier-A strip (v3.4.1 Option B rollback) — bypassed by raw=true.
+          // normalizePricebookPage also bypassed by raw=true (v3.4.4) so raw returns the
+          // truly raw HCP shape (data/total_count/total_pages_count) not the normalized
+          // items/total_items/total_pages shape. project() has its own raw=true guard
+          // internally so the pagination hint is also skipped.
+          if (args?.raw !== true) {
+            result = stripFields(result);
+            result = normalizePricebookPage(result);
+          }
+          result = project(name, args || {}, result, env);
         } catch (toolErr) {
           if (toolErr.message.startsWith("Unknown tool:")) throw toolErr;
           return mcpJson(id, { content: [{ type: "text", text: toolErr.message }], isError: true });
@@ -562,7 +788,7 @@ function getDashboardHTML() {
 <html lang="en">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>HouseCall Pro Dispatch</title>
+<title>HCP Dispatch v2.5</title>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
@@ -662,7 +888,7 @@ input:checked+.slider:before{transform:translateX(16px)}
 </head>
 <body>
 <div class="bar">
-  <div class="bar-l"><span>HouseCall Pro Dispatch</span><span class="ver">v2.5</span></div>
+  <div class="bar-l"><span>HCP Dispatch</span><span class="ver">v2.5</span></div>
   <div class="bar-r">
     <span class="dot" id="dot"></span>
     <span class="cd" id="cd">Refresh in 60s</span>
@@ -679,7 +905,6 @@ input:checked+.slider:before{transform:translateX(16px)}
 </div>
 <div class="slabel">Field staff</div>
 <div class="trow">
-  <!-- Sample team panel. Edit names/roles/colors here AND in TINFO/TIDS/TECH_ORDER below to match your crew. -->
   <div class="tc" id="tc-tech1" onclick="showTech('tech1')">
     <div class="th"><div class="av" style="background:#e0f2f1;color:#00695c">T1</div><div><div class="tn">Technician One</div><div class="ts">Installer</div></div></div>
     <div class="pill p-idle" id="pill-tech1">Idle</div>
@@ -1114,7 +1339,7 @@ function closeM(){document.getElementById('mbg').classList.remove('show');}
 document.addEventListener('keydown',function(e){if(e.key==='Escape')closeM();});
 
 function reqNotif(){try{if(!('Notification' in window))return;if(Notification.permission==='default')Notification.requestPermission();}catch(e){}}
-function notif(e){try{if(!('Notification' in window)||Notification.permission!=='granted')return;var info=EMAP[e.event_type];if(!info||info.silent)return;var n=custName(e);new Notification('HouseCall Pro - '+info.label,{body:n||info.label,tag:e.id});}catch(err){}}
+function notif(e){try{if(!('Notification' in window)||Notification.permission!=='granted')return;var info=EMAP[e.event_type];if(!info||info.silent)return;var n=custName(e);new Notification('HCP - '+info.label,{body:n||info.label,tag:e.id});}catch(err){}}
 
 var cd=POLL_INTERVAL,timer=null,seen={};
 function resetCd(){if(timer)clearInterval(timer);cd=POLL_INTERVAL;timer=setInterval(function(){cd--;document.getElementById('cd').textContent='Refresh in '+cd+'s';if(cd<=0)load();},1000);}
@@ -1174,6 +1399,6 @@ export default {
     if (url.pathname === "/dashboard") {
       return new Response(getDashboardHTML(), { headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-cache, no-store, must-revalidate", "Pragma": "no-cache", "Expires": "0" } });
     }
-    return new Response(`HouseCall Pro MCP Worker v3.3.3 — ${TOOLS.length} tools | /mcp | /webhook | /activity | /dashboard`, { status: 200, headers: CORS });
+    return new Response(`HouseCall Pro MCP Worker v3.4.5 — ${TOOLS.length} tools | /mcp | /webhook | /activity | /dashboard`, { status: 200, headers: CORS });
   },
 };

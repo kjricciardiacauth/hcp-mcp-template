@@ -6,7 +6,7 @@ A public, reusable Cloudflare Worker template that exposes the HouseCall Pro API
 
 ## Key locations
 
-- `worker.js` — The deployable Cloudflare Worker source (all 93 HCP tools)
+- `worker.js` — The deployable Cloudflare Worker source (all 104 HCP tools)
 - `wrangler.toml` — Worker name, KV namespace bindings, entry point
 - `README.md` — Full setup and quick start guide (public-facing)
 - `SETUP_ZERO_KNOWLEDGE.md` — Step-by-step guide for users with no GitHub/Cloudflare/API experience
