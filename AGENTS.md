@@ -9,7 +9,10 @@ A public, reusable Cloudflare Worker template that exposes the HouseCall Pro API
 - `worker.js` — The deployable Cloudflare Worker source (all 104 HCP tools)
 - `wrangler.toml` — Worker name, KV namespace bindings, entry point
 - `README.md` — Full setup and quick start guide (public-facing)
-- `SETUP_ZERO_KNOWLEDGE.md` — Step-by-step guide for users with no GitHub/Cloudflare/API experience
+- `CLAUDE.md` — Entry point loaded when Claude Code opens the repo; frames the install flow
+- `INSTALL.md` — Phase-by-phase runbook for Claude (or a human) driving the install
+- `setup.ps1` / `setup.sh` — Cross-platform wrangler wrapper (KV, secrets, token, smoke probe)
+- `templates/` — MCP config snippet + install-skill scripts referenced by INSTALL.md
 - `examples/` — Usage examples
 
 ## Conventions

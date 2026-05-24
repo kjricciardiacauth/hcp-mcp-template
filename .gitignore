@@ -27,3 +27,6 @@ yarn.lock
 # Logs
 *.log
 logs/
+
+# Install state (written by setup.ps1 / setup.sh; never commit — may contain identifiers)
+.hcp-mcp/

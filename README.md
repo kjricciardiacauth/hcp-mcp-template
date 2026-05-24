@@ -15,14 +15,25 @@ A **plug-and-play Cloudflare Worker** that exposes the HouseCall Pro API as an M
 - **MCP-compliant** — works with Claude Code, claude.ai, and any MCP client
 - **Zero infrastructure** — runs on Cloudflare's free tier
 
-## New User? Start Here
+## Setup in one shot (with Claude Code)
 
-**If you have zero experience with GitHub, Cloudflare, or APIs:** Point Claude at [`SETUP_ZERO_KNOWLEDGE.md`](SETUP_ZERO_KNOWLEDGE.md) and Claude will walk you through the entire setup step-by-step.
+The repo is designed to install itself. Fork, clone, point Claude at it:
 
+```bash
+gh repo fork kjricciardiacauth/hcp-mcp-template --clone --remote
+cd hcp-mcp-template
+claude "install this"
 ```
-Point Claude at this repo, then say:
-"Walk me through SETUP_ZERO_KNOWLEDGE.md and help me deploy this"
-```
+
+Claude reads [`CLAUDE.md`](CLAUDE.md) (the entry point) and follows [`INSTALL.md`](INSTALL.md) — a phase-by-phase runbook covering everything from KV namespace creation through MCP wiring, skill+memory install, and personalization with your real technician and pipeline IDs. The only things you have to supply are:
+
+- Your HCP API key (Claude tells you where to find it)
+- Your name (becomes the label on your first access token)
+- Approval at each phase boundary
+
+Time: ~15 minutes. State persists in `.hcp-mcp/state.json` (gitignored), so partial installs can resume in a fresh session.
+
+**Don't have Claude Code?** Walk the phases in [`INSTALL.md`](INSTALL.md) yourself — the commands are the same. Or follow the dashboard-driven Quick Start below.
 
 ---
 

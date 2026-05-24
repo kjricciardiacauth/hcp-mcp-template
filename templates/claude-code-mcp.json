@@ -1,0 +1,9 @@
+{
+  "_comment": "Paste the 'hcp' entry below into your Claude Code MCP config (typically ~/.claude/mcp.json on mac/Linux, %USERPROFILE%\\.claude\\mcp.json on Windows). Substitute {{WORKER_URL}} with your full https://<subdomain>.workers.dev URL and {{TOKEN}} with the token you minted in INSTALL.md Phase 6. If the file already has an 'mcpServers' object, just add the 'hcp' entry inside it — don't replace the whole file.",
+  "mcpServers": {
+    "hcp": {
+      "url": "{{WORKER_URL}}/mcp?token={{TOKEN}}",
+      "transport": "http"
+    }
+  }
+}
