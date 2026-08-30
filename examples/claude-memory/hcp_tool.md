@@ -13,7 +13,7 @@ type: reference
 
 # HouseCall Pro MCP Tool Reference
 
-Worker: `<your-subdomain>.workers.dev/mcp` — **104 tools** (v3.4.5).
+Worker: `<your-subdomain>.workers.dev/mcp` — **93 tools** (v3.4.6).
 
 ---
 
@@ -23,7 +23,7 @@ All `/mcp` requests require a token. Add `?token=<token>` to the URL, or pass `A
 
 - **Token storage:** Cloudflare KV namespace `MCP_TOKENS` (id `<your-kv-id>`)
 - **KV format:** key = token string, value = `{"name":"Full Name","tier":"read"|"write"}`
-- **Tiers:** `read` = readOnlyHint tools only (list/get); `write` = all 104 tools
+- **Tiers:** `read` = readOnlyHint tools only (list/get); `write` = all 93 tools
 - **Teammate URL:** `https://<your-subdomain>.workers.dev/mcp?token=<their-token>`
 - **Add/revoke:** Cloudflare dashboard → Workers & Pages → KV → MCP_TOKENS
 
@@ -54,6 +54,19 @@ All other HCP fields pass through unchanged. Customer's actual business name (`c
 **Pagination hint (v3.4.0+):** List responses on registered tools get a `_pagination` plaintext field: `"Showing N of M total. Page X of Y. Pass page=Z for next page, or use fetch_all=true for all records."` Read this prose — LLMs ignore structured pagination fields.
 
 **Annotations:** READ/WRITE/DESTROY annotation constants set all 4 MCP hints (readOnlyHint, destructiveHint, idempotentHint, openWorldHint) — drives correct UX in Claude Code / claude.ai confirmation prompts.
+
+---
+
+## v3.4.6 — `list_invoices` has no per-customer filter
+
+HCP **ignores** `customer_uuid` / `customer_id` on `list_invoices` and silently returns the
+entire invoice corpus rather than erroring (verified 2026-08-03). A large result set is NOT
+evidence that a filter applied. The parameter was removed from the tool schema in v3.4.6 — a
+param that silently no-ops is worse than an absent one.
+
+**To get one customer's invoices:** `list_jobs(customer_id)` → `list_job_invoices(job_id)` for
+each job returned. If an accounting system (e.g. QuickBooks Online) is connected, its invoice
+search filters by customer correctly and is the billing system of record.
 
 ---
 

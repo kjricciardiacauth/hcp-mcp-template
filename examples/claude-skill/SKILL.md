@@ -14,7 +14,7 @@ description: HouseCall Pro (HCP) operations and MCP quirks. Use when the user as
 Fill in once you've deployed your fork:
 
 - **URL:** `<your-subdomain>.workers.dev/mcp?token=<token>`
-- **Tool count:** 104 tools (v3.4.5)
+- **Tool count:** 93 tools (v3.4.6)
 - **Auth:** All requests require `?token=<token>` (query param) or `Authorization: Bearer <token>`
 - **Token storage:** Cloudflare KV namespace `MCP_TOKENS` (id: `<your-kv-id>`)
 - **Token format:** `{"name":"Full Name","tier":"read"|"write"}`
@@ -22,7 +22,7 @@ Fill in once you've deployed your fork:
 | Tier | Access |
 |------|--------|
 | `read` | All list/get tools only |
-| `write` | Full 104 tools |
+| `write` | Full 93 tools |
 
 ## Probe-Before-Pull Discipline
 
@@ -41,6 +41,7 @@ Fill in once you've deployed your fork:
 - Line items, pricebook: `unit_price`, `unit_cost`, `price`, `cost` → CENTS
 - Estimate option `total_amount` → CENTS
 - **Exception:** `list_invoices` `due_amount` field → DOLLARS (confirmed anomaly)
+- **No per-customer filter on `list_invoices`** (v3.4.6) — HCP ignores `customer_uuid`/`customer_id` and silently returns the whole corpus, so a big result is not proof a filter applied. Use `list_jobs(customer_id)` → `list_job_invoices(job_id)`, or your accounting system's invoice search.
 
 ## Universal Tier-A Field Strip (v3.4.1+)
 

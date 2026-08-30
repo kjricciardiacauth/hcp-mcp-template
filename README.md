@@ -6,7 +6,7 @@ A **plug-and-play Cloudflare Worker** that exposes the HouseCall Pro API as an M
 
 ## Features
 
-- **104 tools** — complete HCP API coverage (customers, jobs, estimates, invoices, leads, pricebook, dispatch, and more)
+- **93 tools** — complete HCP API coverage (customers, jobs, estimates, invoices, leads, pricebook, dispatch, and more)
 - **Token-based auth** — read/write access tiers, tokens stored in Cloudflare KV
 - **`fetch_all` pagination** — auto-paginate any of 10 list tools, up to ~2000 records
 - **Webhook receiver** — validates HMAC-SHA256, stores events in KV (48h TTL), optional Zapier forwarding
@@ -112,7 +112,7 @@ https://your-worker.workers.dev/mcp?token=my-secret-token-123
 
 ```bash
 curl https://your-worker.workers.dev/
-# → "HouseCall Pro MCP Worker v3.4.5 — 104 tools | /mcp | /webhook | /activity | /dashboard"
+# → "HouseCall Pro MCP Worker v3.4.6 — 93 tools | /mcp | /webhook | /activity | /dashboard"
 ```
 
 ---
@@ -135,7 +135,7 @@ Tokens are stored in the `MCP_TOKENS` KV namespace as JSON:
 | Tier | What it can do |
 |---|---|
 | `read` | `tools/list` and `tools/call` on read-only tools (list/get) only |
-| `write` | Full access — all 104 tools including create, update, delete |
+| `write` | Full access — all 93 tools including create, update, delete |
 
 **To add a user:** KV dashboard → `hcp-tokens` → Add entry → key = token string, value = JSON above.  
 **To revoke:** Delete the key from the KV dashboard.
@@ -205,7 +205,7 @@ Organized by resource:
 **Pipeline:** list statuses, update status (jobs/estimates/leads)  
 **Company:** get info, update franchise info, checklists, webhooks (create/delete)
 
-> Note: 8 undocumented/non-functional endpoints were removed in v2.8.0 compared to the original template. The 104 tools here are all confirmed working against the live HCP API.
+> Note: 8 undocumented/non-functional endpoints were removed in v2.8.0 compared to the original template. The 93 tools here are all confirmed working against the live HCP API.
 
 ---
 
@@ -274,6 +274,7 @@ All are **Secrets** in Cloudflare dashboard — never put them in `wrangler.toml
 
 | Version | Changes |
 |---|---|
+| v3.4.6 | Removed `list_invoices.customer_uuid` — HCP ignores a per-customer filter on this endpoint and silently returns the entire invoice corpus instead of erroring (verified 2026-08-03). Description now documents the `list_jobs` → `list_job_invoices` chain. Unknown paths now return 404 instead of the root banner. |
 | v3.4.5 | Three real worker bugs caught by end-to-end test: `dispatch_job` body shape, `create_estimate` auto-injects default option, `convert_lead` POST not PUT. Description fixes on `update_job_appointment` + 3 `bulk_update_*` tools + `create_estimate` + `create_lead` (now requires `customer_id`) |
 | v3.4.4 | Read-tool polish on 15 more tools (employees, events, appointments, line items, invoices, materials, services, tags, job types, lead sources, pipeline statuses, checklists, etc.). `raw=true` opt-out wired. `normalizePricebookPage` now bypassed by `raw=true` (bug fix). |
 | v3.4.3 | Write-tool description rewrites (~33 tools) with what/when/returns/caveats. Documented the three schedule param conventions across `create_job` / `update_job_schedule` / `create_job_appointment`. No schema field changes. |

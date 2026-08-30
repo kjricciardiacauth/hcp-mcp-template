@@ -169,7 +169,7 @@ Re-check every 15 seconds for up to 2 minutes. If still failing after 2 min, fet
 **Verify:**
 ```bash
 curl https://<worker-subdomain>/
-# Expect: "HouseCall Pro MCP Worker v3.4.5 — 104 tools | /mcp | /webhook | /activity | /dashboard"
+# Expect: "HouseCall Pro MCP Worker v3.4.6 — 93 tools | /mcp | /webhook | /activity | /dashboard"
 ```
 
 **Rollback:** Dashboard → Workers → your worker → Deployments → Rollback (one click).

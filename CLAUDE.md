@@ -35,7 +35,7 @@ Do not skip the verify gates. If a verify fails, work the rollback for that phas
 
 ## What this repo IS
 
-A public Cloudflare Worker template that turns the HouseCall Pro API into an MCP server. Source: `worker.js` (104 tools, v3.4.5). Auto-deploys via Cloudflare Workers Builds when pushed to `main`.
+A public Cloudflare Worker template that turns the HouseCall Pro API into an MCP server. Source: `worker.js` (93 tools, v3.4.6). Auto-deploys via Cloudflare Workers Builds when pushed to `main`.
 
 ## What this repo is NOT
 

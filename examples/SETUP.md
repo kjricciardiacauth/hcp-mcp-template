@@ -109,7 +109,7 @@ To add more users: repeat with a different key. To revoke: delete the entry.
 
 ```bash
 curl https://your-worker.workers.dev/
-# → "HouseCall Pro MCP Worker v3.3.1 — 93 tools | /mcp | /webhook | /activity | /dashboard"
+# → "HouseCall Pro MCP Worker v3.4.6 — 93 tools | /mcp | /webhook | /activity | /dashboard"
 ```
 
 Test MCP with your token:
